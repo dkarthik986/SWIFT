@@ -67,7 +67,7 @@ const formatDirection = (val) => {
     if (!val) return "—";
     const v = String(val).trim().toUpperCase();
     if (v === "I") return "INCOMING";
-    if (v === "O") return "OUTGOING";
+    if (v === "O") return "OUTGOING"; 
     return v;
 };
 const dirClass = (val) => {
@@ -142,6 +142,7 @@ const stringifyExportValue = (value) => {
 };
 
 const escapeCsvCell = (value) => `"${stringifyExportValue(value).replace(/"/g, "\"\"")}"`;
+const safeFileNamePart = (value) => String(value || "").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 70);
 
 const triggerDownload = (blob, filename) => {
     const url = URL.createObjectURL(blob);
@@ -225,6 +226,293 @@ const getPdfRepeatColumns = (columns) => {
     return [];
 };
 
+const exportRawCopiesPdf = async ({ base, exportTitle, rows, columns }) => {
+    await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js", () => !!window.jspdf?.jsPDF);
+    await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js", () => !!window.jspdf?.jsPDF?.API?.autoTable);
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+    const margin = { top: 48, right: 34, bottom: 34, left: 34 };
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const contentWidth = pageWidth - margin.left - margin.right;
+    const metaColumns = columns.filter(col => col.key !== "rawInput");
+    const lineHeight = 8.5;
+    const codePadding = 8;
+    let cursorY = margin.top;
+
+    const drawPageHeader = () => {
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(12);
+        doc.setTextColor(17, 24, 39);
+        doc.text(exportTitle, margin.left, 28);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.text(`Page ${doc.getNumberOfPages()}`, pageWidth - margin.right, 28, { align: "right" });
+    };
+
+    const resetPageCursor = () => {
+        cursorY = margin.top;
+        drawPageHeader();
+    };
+
+    const ensureSpace = (neededHeight) => {
+        if (cursorY + neededHeight <= pageHeight - margin.bottom) return;
+        doc.addPage();
+        resetPageCursor();
+    };
+
+    resetPageCursor();
+
+    rows.forEach((row, idx) => {
+        const copyTitle = row.messageId && row.messageId !== "—"
+            ? `Copy ${idx + 1} - ${row.messageId}`
+            : `Copy ${idx + 1}`;
+        const metaPairs = metaColumns
+            .map(col => [col.label, stringifyExportValue(row?.[col.key])])
+            .filter(([, value]) => value !== "");
+
+        ensureSpace(28);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10);
+        doc.setTextColor(33, 56, 99);
+        doc.text(copyTitle, margin.left, cursorY);
+        cursorY += 10;
+
+        doc.autoTable({
+            startY: cursorY,
+            margin,
+            tableWidth: contentWidth,
+            theme: "grid",
+            head: [["Field", "Value"]],
+            body: metaPairs.length > 0 ? metaPairs : [["Field", "—"]],
+            styles: {
+                fontSize: 8,
+                cellPadding: { top: 4, right: 5, bottom: 4, left: 5 },
+                overflow: "linebreak",
+                valign: "top",
+                lineColor: [226, 232, 240],
+                lineWidth: 0.35,
+            },
+            headStyles: {
+                fillColor: [33, 56, 99],
+                textColor: [255, 255, 255],
+                fontStyle: "bold",
+                fontSize: 8,
+            },
+            columnStyles: {
+                0: { cellWidth: 126, fontStyle: "bold" },
+                1: { cellWidth: contentWidth - 126 },
+            },
+            didDrawPage: () => {
+                drawPageHeader();
+            },
+        });
+
+        cursorY = (doc.lastAutoTable?.finalY || cursorY) + 12;
+        const rawInput = stringifyExportValue(row?.rawInput || "—");
+        const wrappedLines = doc.splitTextToSize(rawInput, contentWidth - (codePadding * 2));
+
+        ensureSpace(26);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(9);
+        doc.setTextColor(17, 24, 39);
+        doc.text("Raw Input", margin.left, cursorY);
+        cursorY += 8;
+
+        let offset = 0;
+        while (offset < wrappedLines.length) {
+            ensureSpace(28);
+            const availableHeight = pageHeight - margin.bottom - cursorY - (codePadding * 2);
+            const linesPerPage = Math.max(1, Math.floor(availableHeight / lineHeight));
+            const lineChunk = wrappedLines.slice(offset, offset + linesPerPage);
+            const boxHeight = (lineChunk.length * lineHeight) + (codePadding * 2);
+
+            doc.setFillColor(248, 250, 252);
+            doc.setDrawColor(226, 232, 240);
+            doc.roundedRect(margin.left, cursorY, contentWidth, boxHeight, 6, 6, "FD");
+            doc.setFont("courier", "normal");
+            doc.setFontSize(7);
+            doc.setTextColor(17, 24, 39);
+            doc.text(lineChunk, margin.left + codePadding, cursorY + codePadding + 5);
+
+            cursorY += boxHeight + 10;
+            offset += linesPerPage;
+
+            if (offset < wrappedLines.length) {
+                doc.addPage();
+                resetPageCursor();
+                doc.setFont("helvetica", "bold");
+                doc.setFontSize(9);
+                doc.setTextColor(17, 24, 39);
+                doc.text(`Raw Input (cont.) - ${copyTitle}`, margin.left, cursorY);
+                cursorY += 8;
+            }
+        }
+
+        cursorY += 6;
+        ensureSpace(12);
+        doc.setDrawColor(203, 213, 225);
+        doc.line(margin.left, cursorY, pageWidth - margin.right, cursorY);
+        cursorY += 14;
+    });
+
+    doc.save(`${base}.pdf`);
+};
+
+const exportFieldPairsPdf = async ({ base, exportTitle, rows, columns }) => {
+    await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js", () => !!window.jspdf?.jsPDF);
+    await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js", () => !!window.jspdf?.jsPDF?.API?.autoTable);
+
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+    const margin = { top: 48, right: 34, bottom: 34, left: 34 };
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const contentWidth = pageWidth - margin.left - margin.right;
+    const pairColumns = ["recordNo", "field", "value"];
+    const metaColumns = columns.filter(col => !pairColumns.includes(col.key));
+    let cursorY = margin.top;
+
+    const drawPageHeader = () => {
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(12);
+        doc.setTextColor(17, 24, 39);
+        doc.text(exportTitle, margin.left, 28);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(8);
+        doc.text(`Page ${doc.getNumberOfPages()}`, pageWidth - margin.right, 28, { align: "right" });
+    };
+
+    const resetPageCursor = () => {
+        cursorY = margin.top;
+        drawPageHeader();
+    };
+
+    const ensureSpace = (neededHeight) => {
+        if (cursorY + neededHeight <= pageHeight - margin.bottom) return;
+        doc.addPage();
+        resetPageCursor();
+    };
+
+    const groups = [];
+    const grouped = new Map();
+
+    rows.forEach((row) => {
+        const groupKey = metaColumns.length > 0
+            ? metaColumns.map(col => stringifyExportValue(row?.[col.key])).join("||")
+            : "__single__";
+        let group = grouped.get(groupKey);
+        if (!group) {
+            group = {
+                meta: Object.fromEntries(metaColumns.map(col => [col.key, row?.[col.key]])),
+                items: [],
+            };
+            grouped.set(groupKey, group);
+            groups.push(group);
+        }
+        group.items.push({
+            field: stringifyExportValue(row?.field || "—") || "—",
+            value: stringifyExportValue(row?.value || "—") || "—",
+        });
+    });
+
+    resetPageCursor();
+
+    groups.forEach((group, groupIdx) => {
+        const headingParts = [
+            stringifyExportValue(group.meta.messageType),
+            stringifyExportValue(group.meta.reference || group.meta.messageReference),
+        ].filter(Boolean);
+        const metaPairs = metaColumns
+            .map(col => [col.label, stringifyExportValue(group.meta[col.key] || "—")])
+            .filter(([, value]) => value && value !== "—");
+        const groupHeading = headingParts.join(" • ");
+        const shouldShowHeading = !!groupHeading || groups.length > 1;
+
+        if (shouldShowHeading) {
+            ensureSpace(28);
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(10);
+            doc.setTextColor(33, 56, 99);
+            doc.text(groupHeading || `Record ${groupIdx + 1}`, margin.left, cursorY);
+            cursorY += 10;
+        }
+
+        if (metaPairs.length > 0) {
+            doc.autoTable({
+                startY: cursorY,
+                margin,
+                tableWidth: contentWidth,
+                theme: "grid",
+                head: [["Field", "Value"]],
+                body: metaPairs,
+                styles: {
+                    fontSize: 8,
+                    cellPadding: { top: 4, right: 5, bottom: 4, left: 5 },
+                    overflow: "linebreak",
+                    valign: "top",
+                    lineColor: [226, 232, 240],
+                    lineWidth: 0.35,
+                },
+                headStyles: {
+                    fillColor: [33, 56, 99],
+                    textColor: [255, 255, 255],
+                    fontStyle: "bold",
+                    fontSize: 8,
+                },
+                columnStyles: {
+                    0: { cellWidth: 126, fontStyle: "bold" },
+                    1: { cellWidth: contentWidth - 126 },
+                },
+                didDrawPage: () => {
+                    drawPageHeader();
+                },
+            });
+            cursorY = (doc.lastAutoTable?.finalY || cursorY) + 12;
+        }
+
+        doc.autoTable({
+            startY: cursorY,
+            margin,
+            tableWidth: contentWidth,
+            theme: "grid",
+            head: [["Field", "Value"]],
+            body: group.items.map(item => [item.field, item.value]),
+            styles: {
+                fontSize: 8.5,
+                cellPadding: { top: 5, right: 6, bottom: 5, left: 6 },
+                overflow: "linebreak",
+                valign: "top",
+                lineColor: [226, 232, 240],
+                lineWidth: 0.35,
+            },
+            headStyles: {
+                fillColor: [33, 56, 99],
+                textColor: [255, 255, 255],
+                fontStyle: "bold",
+                fontSize: 8.5,
+            },
+            columnStyles: {
+                0: { cellWidth: 170, fontStyle: "bold", textColor: [55, 65, 81] },
+                1: { cellWidth: contentWidth - 170, textColor: [17, 24, 39] },
+            },
+            didDrawPage: () => {
+                drawPageHeader();
+            },
+        });
+        cursorY = (doc.lastAutoTable?.finalY || cursorY) + 10;
+
+        cursorY += 4;
+        ensureSpace(12);
+        doc.setDrawColor(203, 213, 225);
+        doc.line(margin.left, cursorY, pageWidth - margin.right, cursorY);
+        cursorY += 16;
+    });
+
+    doc.save(`${base}.pdf`);
+};
+
 const exportRowsAsFile = async ({ format, rows, columns, fileBaseName, title, sheetName }) => {
     const safeRows = Array.isArray(rows) ? rows : [];
     const safeColumns = (columns && columns.length > 0)
@@ -281,6 +569,16 @@ const exportRowsAsFile = async ({ format, rows, columns, fileBaseName, title, sh
     }
 
     if (format === "pdf") {
+        if (safeColumns.some(c => c.key === "rawInput")) {
+            await exportRawCopiesPdf({ base, exportTitle, rows: safeRows, columns: safeColumns });
+            return;
+        }
+
+        if (safeColumns.some(c => c.key === "field") && safeColumns.some(c => c.key === "value")) {
+            await exportFieldPairsPdf({ base, exportTitle, rows: safeRows, columns: safeColumns });
+            return;
+        }
+
         await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js", () => !!window.jspdf?.jsPDF);
         await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js", () => !!window.jspdf?.jsPDF?.API?.autoTable);
         const { jsPDF } = window.jspdf;
@@ -420,6 +718,15 @@ const FIXED_TABLE_COLUMN_KEYS = new Set([
 ]);
 
 const FIXED_TABLE_COLUMNS = COLUMNS.filter(col => FIXED_TABLE_COLUMN_KEYS.has(col.key));
+const MAIN_EXPORT_TARGETS = [
+    { key: "table", label: "Result Table" },
+    { key: "header", label: "Header" },
+    { key: "body", label: "Body" },
+    { key: "rawcopies", label: "Raw Copies" },
+    { key: "payload", label: "FIN Payload" },
+    { key: "details", label: "All Fields" },
+    { key: "history", label: "History" },
+];
 
 const FIELD_DEFINITIONS = [
     { key: "format",               label: "Message Format",          group: "Classification", type: "select",       optKey: "formats",                placeholder: "All Formats",        stateKeys: ["format"],                                   colKeys: ["format"],             backendParam: "messageType"           },
@@ -1108,10 +1415,15 @@ function FloatingModal({
                 const keys = ["header", "body", "history", "payload", "details", "rawcopies"];
                 const blocks = keys.map(k => ({ ...getSectionData(k, rcData) }));
                 const mergedRows = [];
-                const keySet = new Set(["section", "recordNo"]);
+                const keySet = new Set(["section"]);
                 blocks.forEach(block => {
+                    const hasNativeIndex = block.columns?.some(col => col.key === "index" || col.label === "#");
                     block.rows.forEach((row, idx) => {
-                        const merged = { section: block.label, recordNo: idx + 1 };
+                        const merged = { section: block.label };
+                        if (!hasNativeIndex) {
+                            merged.recordNo = idx + 1;
+                            keySet.add("recordNo");
+                        }
                         Object.entries(row).forEach(([k, v]) => { merged[k] = v; keySet.add(k); });
                         mergedRows.push(merged);
                     });
@@ -1702,6 +2014,7 @@ function Search() {
     const [highlightText,   setHighlightText]   = useState("");
     const [showExportMenu,  setShowExportMenu]  = useState(false);
     const [exportScope,     setExportScope]     = useState("all");
+    const [exportTarget,    setExportTarget]    = useState("table");
     const [toastMsg,        setToastMsg]        = useState(null);
     const [openModals,      setOpenModals]      = useState([]);
     const openModalsRef = useRef([]);   // always-current mirror — no stale closure
@@ -2263,13 +2576,29 @@ function Search() {
     };
 
     // ── Export ───────────────────────────────────────────────────────────────
-    const fetchAllRows = async () => {
-        const params = buildParams(searchState, 0, serverTotal > 0 ? serverTotal : 10000);
+    const fetchSearchPage = useCallback(async (page, size) => {
+        const params = buildParams(searchState, page, size);
         const res = await fetch(`${API_BASE_URL}?${params.toString()}`, { headers: authHeaders() });
-        if (!res.ok) throw new Error(`Export fetch failed (${res.status})`);
+        if (!res.ok) throw new Error(`Export fetch failed (${res.status}) on page ${page + 1}`);
         const data = await res.json();
-        return data.content || data;
-    };
+        return {
+            rows: Array.isArray(data?.content) ? data.content : (Array.isArray(data) ? data : []),
+            totalPages: Number(data?.totalPages) || 1,
+            pageSize: Number(data?.pageSize) || size,
+        };
+    }, [authHeaders, buildParams, searchState]);
+
+    const fetchAllRows = useCallback(async () => {
+        const firstPage = await fetchSearchPage(0, serverTotal > 0 ? serverTotal : 10000);
+        if (firstPage.totalPages <= 1) return firstPage.rows;
+
+        const allRows = [...firstPage.rows];
+        for (let page = 1; page < firstPage.totalPages; page += 1) {
+            const pageData = await fetchSearchPage(page, firstPage.pageSize);
+            allRows.push(...pageData.rows);
+        }
+        return allRows;
+    }, [fetchSearchPage, serverTotal]);
 
     const getExportRows = (scope) => {
         if (scope === "selected") return processed.filter(m => selectedRows.has(getMsgId(m)));
@@ -2277,21 +2606,33 @@ function Search() {
         return null;
     };
 
-    const runExport = async (scope, format) => {
-        setShowExportMenu(false);
-        let rows;
-        if (scope === "all") {
-            setIsExporting(true);
-            showToast(`Fetching all ${serverTotal.toLocaleString()} records…`, "info");
-            try { rows = await fetchAllRows(); }
-            catch (e) { showToast("Export failed: " + e.message, "error"); setIsExporting(false); return; }
-            setIsExporting(false);
-        } else {
-            rows = getExportRows(scope);
+    const fetchRawCopiesByRefs = useCallback(async (references) => {
+        const uniqueRefs = [...new Set((references || []).filter(Boolean))];
+        if (uniqueRefs.length === 0) return new Map();
+
+        const grouped = new Map(uniqueRefs.map(ref => [ref, []]));
+        const batchSize = 100;
+        for (let i = 0; i < uniqueRefs.length; i += batchSize) {
+            const batch = uniqueRefs.slice(i, i + batchSize);
+            const res = await fetch(`${API_RAW_COPIES_URL}/by-refs`, {
+                method: "POST",
+                headers: authHeaders(),
+                body: JSON.stringify(batch),
+            });
+            if (!res.ok) throw new Error(`Raw copies export fetch failed (${res.status})`);
+            const data = await res.json();
+            const payload = data?.data || data || {};
+            Object.entries(payload).forEach(([ref, copies]) => {
+                grouped.set(ref, Array.isArray(copies) ? copies : []);
+            });
         }
-        const cols = shownCols.map(c => ({ key: c.key, label: c.label }));
-        const mappedRows = (rows || []).map(msg => {
-            const out = {};
+        return grouped;
+    }, [authHeaders]);
+
+    const buildResultTableDataset = useCallback((messages) => {
+        const columns = [{ key: "reference", label: "Reference" }, ...shownCols.map(c => ({ key: c.key, label: c.label }))];
+        const rows = (messages || []).map(msg => {
+            const out = { reference: getReference(msg) };
             shownCols.forEach(c => {
                 out[c.key] = c.key === "format"
                     ? getDisplayFormat(msg)
@@ -2301,18 +2642,280 @@ function Search() {
             });
             return out;
         });
+        return { label: "Result Table", columns, rows };
+    }, [shownCols, getReference]);
+
+    const getExportMessageMeta = useCallback((msg) => ({
+        messageReference: msg.reference || msg.messageReference || "—",
+        reference: getReference(msg) || "—",
+        messageType: getDisplayType(msg) || msg.messageCode || "—",
+        messageFormat: getDisplayFormat(msg) || "—",
+        sequenceNumber: msg.sequenceNumber ?? "—",
+        creationDate: msg.creationDate || msg.date || "—",
+    }), [getReference]);
+
+    const buildMessageSectionData = useCallback((msg, sectionKey, rawCopies = []) => {
+        const raw = msg.rawMessage || {};
+
+        if (sectionKey === "header") {
+            const pairs = [
+                ["Message Code", msg.messageCode || getDisplayType(msg)],
+                ["Message Format", raw.messageFormat || getDisplayFormat(msg)],
+                ["Reference", msg.reference],
+                ["Transaction Reference", msg.transactionReference],
+                ["Transfer Reference", msg.transferReference],
+                ["MUR", msg.mur || msg.userReference],
+                ["Creation Date", msg.creationDate || msg.date],
+                ["Received", msg.receivedDT],
+                ["Remittance", msg.remittanceInfo],
+                ["UETR", msg.uetr],
+                ["Workflow", msg.workflow],
+                ["Environment", msg.environment],
+                ["Status Message", msg.statusMessage],
+                ["Sender", msg.sender],
+                ["Receiver", msg.receiver],
+            ].filter(([, v]) => v !== undefined && v !== null && v !== "");
+            return {
+                label: "Header",
+                columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
+                rows: pairs.map(([field, value]) => ({ field, value: stringifyExportValue(value) })),
+            };
+        }
+
+        if (sectionKey === "body") {
+            const pairs = [
+                ["Message Code", msg.messageCode || getDisplayType(msg)],
+                ["Message Type", getDisplayFormat(msg)],
+                ["Network Protocol", msg.networkProtocol || msg.network],
+                ["Network Channel", msg.networkChannel || msg.backendChannel],
+                ["Network Priority", msg.networkPriority],
+                ["Country", msg.country],
+                ["Owner", msg.owner || msg.ownerUnit],
+                ["Workflow", msg.workflow],
+                ["Direction", formatDirection(msg.io || msg.direction)],
+                ["Status", msg.status],
+                ["Phase", msg.phase],
+                ["Action", msg.action],
+                ["Reason", msg.reason],
+                ["Environment", msg.environment],
+                ["Session No.", msg.sessionNumber],
+                ["Sequence No.", msg.sequenceNumber],
+            ];
+            return {
+                label: "Body",
+                columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
+                rows: pairs.map(([field, value]) => ({ field, value: stringifyExportValue(value || "—") })),
+            };
+        }
+
+        if (sectionKey === "history") {
+            const lines = msg.historyLines || raw.historyLines || [];
+            return {
+                label: "History",
+                columns: [
+                    { key: "index", label: "#" },
+                    { key: "dateTime", label: "Date Time" },
+                    { key: "phase", label: "Phase" },
+                    { key: "action", label: "Action" },
+                    { key: "reason", label: "Reason" },
+                    { key: "entity", label: "Entity" },
+                    { key: "channel", label: "Channel" },
+                    { key: "user", label: "User" },
+                    { key: "comment", label: "Comment" },
+                ],
+                rows: lines.map((line, idx) => ({
+                    index: line.index || idx + 1,
+                    dateTime: line.historyDate ? new Date(line.historyDate).toLocaleString("en-US", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }) : "—",
+                    phase: line.phase || "—",
+                    action: line.action || "—",
+                    reason: line.reason || "—",
+                    entity: line.entity || "—",
+                    channel: line.channel || "—",
+                    user: line.user || "—",
+                    comment: line.comment || "—",
+                })),
+            };
+        }
+
+        if (sectionKey === "payload") {
+            const lines = msg.block4Fields || raw.mtPayload?.block4Fields || [];
+            return {
+                label: "FIN Payload",
+                columns: [
+                    { key: "index", label: "#" },
+                    { key: "tag", label: "Tag" },
+                    { key: "label", label: "Field Label" },
+                    { key: "rawValue", label: "Raw Value" },
+                    { key: "components", label: "Components" },
+                ],
+                rows: lines.map((line, idx) => ({
+                    index: idx + 1,
+                    tag: line.tag || "—",
+                    label: line.label || "—",
+                    rawValue: line.rawValue || "—",
+                    components: line.components && Object.keys(line.components).length > 0 ? JSON.stringify(line.components) : "—",
+                })),
+            };
+        }
+
+        if (sectionKey === "details") {
+            const ALL_FIELDS = [["id","ID"],["messageType","FORMAT"],["messageCode","TYPE"],["messageTypeDescription","DESCRIPTION"],["io","DIRECTION"],["status","STATUS"],["phase","PHASE"],["action","ACTION"],["reason","REASON"],["statusMessage","STATUS MESSAGE"],["statusChangeSource","STATUS SOURCE"],["statusDecision","STATUS DECISION"],["reference","MESSAGE REF"],["transactionReference","TXN REF"],["mur","MUR (TAG 20)"],["sender","SENDER"],["receiver","RECEIVER"],["senderInstitutionName","SENDER NAME"],["receiverInstitutionName","RECEIVER NAME"],["amount","AMOUNT"],["ccy","CURRENCY"],["valueDate","VALUE DATE"],["networkProtocol","PROTOCOL"],["networkChannel","NETWORK CHANNEL"],["networkPriority","NETWORK PRIORITY"],["deliveryMode","DELIVERY MODE"],["service","SERVICE"],["backendChannel","BACKEND CHANNEL"],["backendChannelProtocol","CHANNEL PROTOCOL"],["workflow","WORKFLOW"],["workflowModel","WORKFLOW MODEL"],["owner","OWNER"],["processingType","PROCESSING TYPE"],["processPriority","PROCESS PRIORITY"],["profileCode","PROFILE CODE"],["originatorApplication","ORIGINATOR APP"],["sessionNumber","SESSION NO"],["sequenceNumber","SEQUENCE NO"],["creationDate","CREATED"],["receivedDT","RECEIVED"],["statusDate","STATUS DATE"],["valueDate","VALUE DATE"],["bankOperationCode","BANK OP CODE"],["detailsOfCharges","CHARGES"],["remittanceInfo","REMITTANCE"],["applicationId","APP ID"],["serviceId","SERVICE ID"],["logicalTerminalAddress","LOGICAL TERMINAL"],["messagePriority","MSG PRIORITY"],["pdeIndication","PDE"],["bulkType","BULK TYPE"],["nrIndicator","NR IND"],["channelCode","CHANNEL CODE"]];
+            const shown = new Set();
+            const ordered = [];
+            ALL_FIELDS.forEach(([k, label]) => {
+                const val = raw[k] ?? msg[k];
+                if (val !== undefined && val !== null && val !== "") {
+                    ordered.push({ label, val });
+                    shown.add(k);
+                }
+            });
+            Object.entries(raw).forEach(([k, v]) => {
+                if (!shown.has(k) && k !== "mtPayload" && k !== "block4Fields" && k !== "rawFin" && v !== undefined && v !== null && v !== "") {
+                    ordered.push({ label: k.toUpperCase(), val: v });
+                }
+            });
+            return {
+                label: "All Fields",
+                columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
+                rows: ordered.map(item => ({ field: item.label, value: stringifyExportValue(item.val) })),
+            };
+        }
+
+        if (sectionKey === "rawcopies") {
+            return {
+                label: "Raw Copies",
+                columns: [
+                    { key: "index", label: "#" },
+                    { key: "messageId", label: "Message ID" },
+                    { key: "messageTypeCode", label: "Type" },
+                    { key: "direction", label: "Direction" },
+                    { key: "currentStatus", label: "Status" },
+                    { key: "senderAddress", label: "Sender" },
+                    { key: "receiverAddress", label: "Receiver" },
+                    { key: "protocol", label: "Protocol" },
+                    { key: "receivedAt", label: "Received At" },
+                    { key: "inputType", label: "Input Type" },
+                    { key: "source", label: "Source" },
+                    { key: "rawInput", label: "Raw Input" },
+                ],
+                rows: (rawCopies || []).map((row, idx) => ({
+                    index: idx + 1,
+                    messageId: row.messageId || "—",
+                    messageTypeCode: row.messageTypeCode || "—",
+                    direction: row.direction || "—",
+                    currentStatus: row.currentStatus || "—",
+                    senderAddress: row.senderAddress || "—",
+                    receiverAddress: row.receiverAddress || "—",
+                    protocol: row.protocol || "—",
+                    receivedAt: fmtDate(row.receivedAt || row.ampDateReceived),
+                    inputType: row.inputType || "—",
+                    source: row.source || "—",
+                    rawInput: row.rawInput || "—",
+                })),
+            };
+        }
+
+        return { label: "Section", columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }], rows: [] };
+    }, [getDisplayType, getDisplayFormat]);
+
+    const buildSectionDataset = useCallback(async (messages, sectionKey) => {
+        if (sectionKey === "table") return buildResultTableDataset(messages);
+
+        const needsRawCopies = sectionKey === "rawcopies" || sectionKey === "allcomponents";
+        const rawCopyMap = needsRawCopies
+            ? await fetchRawCopiesByRefs(messages.map(msg => msg.reference || msg.messageReference).filter(Boolean))
+            : new Map();
+
+        const baseColumns = [
+            { key: "messageReference", label: "Message Reference" },
+            { key: "reference", label: "Reference" },
+            { key: "messageType", label: "Message Type" },
+            { key: "messageFormat", label: "Message Format" },
+            { key: "sequenceNumber", label: "Seq No." },
+            { key: "creationDate", label: "Creation Date" },
+        ];
+        const sectionBaseColumns = sectionKey === "rawcopies"
+            ? baseColumns.filter(col => col.key !== "reference")
+            : baseColumns;
+
+        if (sectionKey === "allcomponents") {
+            const blockKeys = ["header", "body", "history", "payload", "details", "rawcopies"];
+            const keySet = new Set(["messageReference", "reference", "messageType", "messageFormat", "sequenceNumber", "creationDate", "section"]);
+            const rows = [];
+
+            messages.forEach(msg => {
+                const meta = getExportMessageMeta(msg);
+                const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
+                blockKeys.forEach(blockKey => {
+                    const block = buildMessageSectionData(msg, blockKey, rcRows);
+                    const hasNativeIndex = block.columns?.some(col => col.key === "index" || col.label === "#");
+                    block.rows.forEach((row, idx) => {
+                        const merged = { ...meta, section: block.label };
+                        if (!hasNativeIndex) {
+                            merged.recordNo = idx + 1;
+                            keySet.add("recordNo");
+                        }
+                        Object.entries(row).forEach(([key, value]) => {
+                            merged[key] = value;
+                            keySet.add(key);
+                        });
+                        rows.push(merged);
+                    });
+                });
+            });
+
+            const columns = [...keySet].map(key => ({ key, label: key === "recordNo" ? "#" : toPrettyLabel(key) }));
+            return { label: "All Components", columns, rows };
+        }
+
+        const sampleBlock = buildMessageSectionData(messages[0] || {}, sectionKey, []);
+        const hasNativeIndex = sampleBlock.columns?.some(col => col.key === "index" || col.label === "#");
+        const columns = [
+            ...sectionBaseColumns,
+            ...(hasNativeIndex ? [] : [{ key: "recordNo", label: "#" }]),
+            ...sampleBlock.columns,
+        ];
+        const rows = [];
+
+        messages.forEach(msg => {
+            const meta = getExportMessageMeta(msg);
+            const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
+            const block = buildMessageSectionData(msg, sectionKey, rcRows);
+            block.rows.forEach((row, idx) => {
+                rows.push(hasNativeIndex ? { ...meta, ...row } : { ...meta, recordNo: idx + 1, ...row });
+            });
+        });
+
+        return { label: sampleBlock.label, columns, rows };
+    }, [buildMessageSectionData, buildResultTableDataset, fetchRawCopiesByRefs, getExportMessageMeta]);
+
+    const runExport = async (scope, targetKey, format) => {
+        setShowExportMenu(false);
+        setIsExporting(true);
         try {
+            let messages;
+            if (scope === "all") {
+                const label = MAIN_EXPORT_TARGETS.find(target => target.key === targetKey)?.label || "data";
+                showToast(`Fetching all ${serverTotal.toLocaleString()} records for ${label} export…`, "info");
+                messages = await fetchAllRows();
+            } else {
+                messages = getExportRows(scope) || [];
+            }
+
+            const dataset = await buildSectionDataset(messages, targetKey);
             await exportRowsAsFile({
                 format,
-                rows: mappedRows,
-                columns: cols,
-                fileBaseName: "swift_messages",
-                title: "SWIFT Messages",
-                sheetName: "SWIFT Messages",
+                rows: dataset.rows,
+                columns: dataset.columns,
+                fileBaseName: `swift_messages_${safeFileNamePart(dataset.label.toLowerCase().replace(/\s+/g, "_"))}_${scope}`,
+                title: `${dataset.label} - SWIFT Messages`,
+                sheetName: dataset.label,
             });
-            showToast(`Exported ${mappedRows.length.toLocaleString()} rows as ${format.toUpperCase()}`);
+            showToast(`Exported ${dataset.label} (${dataset.rows.length.toLocaleString()} rows) as ${format.toUpperCase()}`);
         } catch (e) {
             showToast(`Export failed: ${e.message}`, "error");
+        } finally {
+            setIsExporting(false);
         }
     };
 
@@ -2978,14 +3581,24 @@ function Search() {
                                 const isDisabled = s.key==="selected" && selectedRows.size===0;
                                 return <button key={s.key} className={`export-scope-tab${exportScope===s.key?" export-scope-active":""}`} style={isDisabled?{opacity:0.4,cursor:"not-allowed",pointerEvents:"all"}:{}} onClick={()=>{ if(isDisabled){ showToast("No rows selected","error"); return; } setExportScope(s.key); }} title={isDisabled?"Select rows first":undefined}><span className="scope-tab-label">{s.label}</span><span className="scope-tab-count">{typeof s.count==="number"?s.count.toLocaleString():s.count}</span></button>;
                             })}</div></div>
+                            <div className="export-section-block">
+                                <div className="txn-export-scope-label">Export Section</div>
+                                <div className="txn-export-scope-grid">
+                                    {MAIN_EXPORT_TARGETS.map(target=>(
+                                        <button key={target.key} className={`txn-export-scope-btn${exportTarget===target.key?" active":""}`} onClick={()=>setExportTarget(target.key)}>
+                                            {target.label}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
                             <div className="export-format-divider"><span>Format</span></div>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,"csv")}><span className="export-opt-icon export-icon-csv">CSV</span><span className="export-opt-info"><span className="export-opt-name">Comma Separated</span><span className="export-opt-ext">.csv</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,"excel")}><span className="export-opt-icon export-icon-xlsx">XLS</span><span className="export-opt-info"><span className="export-opt-name">Excel Workbook</span><span className="export-opt-ext">.xlsx</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,"json")}><span className="export-opt-icon export-icon-json">JSON</span><span className="export-opt-info"><span className="export-opt-name">JSON Data</span><span className="export-opt-ext">.json</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,"pdf")}><span className="export-opt-icon export-icon-pdf">PDF</span><span className="export-opt-info"><span className="export-opt-name">Portable Document</span><span className="export-opt-ext">.pdf</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,"word")}><span className="export-opt-icon export-icon-word">DOC</span><span className="export-opt-info"><span className="export-opt-name">Word Document</span><span className="export-opt-ext">.doc</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,"xml")}><span className="export-opt-icon export-icon-xml">XML</span><span className="export-opt-info"><span className="export-opt-name">XML Data</span><span className="export-opt-ext">.xml</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,"txt")}><span className="export-opt-icon export-icon-txt">TXT</span><span className="export-opt-info"><span className="export-opt-name">Plain Text</span><span className="export-opt-ext">.txt</span></span></button>
+                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"csv")}><span className="export-opt-icon export-icon-csv">CSV</span><span className="export-opt-info"><span className="export-opt-name">Comma Separated</span><span className="export-opt-ext">.csv</span></span></button>
+                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"excel")}><span className="export-opt-icon export-icon-xlsx">XLS</span><span className="export-opt-info"><span className="export-opt-name">Excel Workbook</span><span className="export-opt-ext">.xlsx</span></span></button>
+                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"json")}><span className="export-opt-icon export-icon-json">JSON</span><span className="export-opt-info"><span className="export-opt-name">JSON Data</span><span className="export-opt-ext">.json</span></span></button>
+                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"pdf")}><span className="export-opt-icon export-icon-pdf">PDF</span><span className="export-opt-info"><span className="export-opt-name">Portable Document</span><span className="export-opt-ext">.pdf</span></span></button>
+                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"word")}><span className="export-opt-icon export-icon-word">DOC</span><span className="export-opt-info"><span className="export-opt-name">Word Document</span><span className="export-opt-ext">.doc</span></span></button>
+                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"xml")}><span className="export-opt-icon export-icon-xml">XML</span><span className="export-opt-info"><span className="export-opt-name">XML Data</span><span className="export-opt-ext">.xml</span></span></button>
+                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"txt")}><span className="export-opt-icon export-icon-txt">TXT</span><span className="export-opt-info"><span className="export-opt-name">Plain Text</span><span className="export-opt-ext">.txt</span></span></button>
                         </div>}
                     </div>
                 </div>

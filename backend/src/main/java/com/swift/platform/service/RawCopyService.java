@@ -152,6 +152,30 @@ public class RawCopyService {
         return new RawCopiesResponse(messageReference, dtos.size(), dtos);
     }
 
+    public Map<String, List<RawCopyDTO>> getByMessageReferences(List<String> messageReferences) {
+        List<String> refs = messageReferences == null ? Collections.emptyList() : messageReferences.stream()
+                .filter(this::notBlank)
+                .distinct()
+                .toList();
+
+        if (refs.isEmpty()) return Collections.emptyMap();
+
+        String col = appConfig.getRawCopiesCollection();
+        Query q = new Query(Criteria.where("messageReference").in(refs))
+                .with(Sort.by(Sort.Direction.ASC, "messageReference").and(Sort.by(Sort.Direction.ASC, "receivedAt")));
+
+        List<Document> docs = mongoTemplate.find(q, Document.class, col);
+        Map<String, List<RawCopyDTO>> grouped = new LinkedHashMap<>();
+        refs.forEach(ref -> grouped.put(ref, new ArrayList<>()));
+        docs.stream()
+                .map(this::toDTO)
+                .forEach(dto -> {
+                    String ref = dto.getMessageReference();
+                    if (notBlank(ref)) grouped.computeIfAbsent(ref, key -> new ArrayList<>()).add(dto);
+                });
+        return grouped;
+    }
+
     // ── Dropdown distinct values ───────────────────────────────────────────
     public Map<String, List<String>> getDropdownOptions() {
         String col = appConfig.getRawCopiesCollection();
@@ -204,7 +228,7 @@ public class RawCopyService {
         return v.toString();
     }
 
-    /** Safely get a date field that may be stored as Date object or ISO String */
+
     private String dateStr(Document doc, String key) {
         Object v = doc.get(key);
         if (v == null) return null;
@@ -215,7 +239,6 @@ public class RawCopyService {
 
     private List<String> distinct(String field, String col) {
         try {
-            // Use Object.class to handle mixed-type fields, then stringify
             return mongoTemplate.findDistinct(new Query(), field, col, Object.class)
                     .stream()
                     .filter(v -> v != null)

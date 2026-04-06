@@ -68,6 +68,16 @@ public class RawCopyController {
         return ApiResponse.ok(rawCopyService.getByMessageReference(messageReference));
     }
 
+    @PostMapping("/by-refs")
+    public ApiResponse<Map<String, List<RawCopyDTO>>> getByRefs(
+            @RequestBody List<String> messageReferences,
+            HttpServletRequest req) {
+        String employeeId = (String) req.getAttribute("employeeId");
+        int refCount = messageReferences == null ? 0 : messageReferences.size();
+        auditService.log(employeeId, "RAW_COPY_BY_REFS", "count=" + refCount, req.getRemoteAddr());
+        return ApiResponse.ok(rawCopyService.getByMessageReferences(messageReferences));
+    }
+
     @GetMapping("/dropdown-options")
     public ApiResponse<Map<String, List<String>>> dropdownOptions() {
         return ApiResponse.ok(rawCopyService.getDropdownOptions());
