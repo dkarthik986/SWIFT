@@ -6,7 +6,7 @@ const ICONS = {
   profile: <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>,
 };
 
-export default function TabBar({ tabs, activeTabId, onSwitch, onClose }) {
+export default function TabBar({ tabs, activeTabId, onSwitch, onClose, rightSlot = null }) {
   const scrollRef  = useRef(null);
   const [locked,   setLocked]  = useState(false);
   const [shakeId,  setShakeId] = useState(null);
@@ -94,6 +94,7 @@ export default function TabBar({ tabs, activeTabId, onSwitch, onClose }) {
           </div>
         )}
       </div>
+      {rightSlot && <div className="tabbar-tools">{rightSlot}</div>}
     </div>
   );
 }

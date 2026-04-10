@@ -2,14 +2,11 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from "react"
 import "./Search.css";
 import "./RawCopies.css";
 import { useAuth } from "../AuthContext";
-
-// ── All API endpoints read from .env — no hardcoded URLs ─────────────────────
 const API_BASE_URL      = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search`;
 const API_DROPDOWN_URL   = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/dropdown-options`;
 const API_FIELD_CFG_URL  = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/field-config`;
 const API_RAW_COPIES_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/raw-copies`;
 
-// ── MT/MX pair map ────────────────────────────────────────────────────────────
 const BASE_MT_MX_PAIRS = {
     "MT103/pacs.008": ["MT103", "pacs.008"],
     "MT199/pacs.002": ["MT199", "pacs.002"],
@@ -18,14 +15,9 @@ const BASE_MT_MX_PAIRS = {
     "MT940/camt.053": ["MT940", "camt.053"],
 };
 let allMtMxTypeMap = { ...BASE_MT_MX_PAIRS };
-
-// Bug #7 fix: previous code used new Date(y, m, d) where m came from splitting
-// "YYYY/MM/DD" — making it 1-indexed while Date() expects 0-indexed months.
-// For end-of-month dates this caused overflow: Jan 31 → Mar 3 instead of Feb 28.
 const addOneMonth = (dateStr) => {
     if (!dateStr) return "";
     const [y, m, d] = dateStr.split("/").map(Number);
-    // Advance month correctly: m is 1-indexed, convert to 0-indexed for Date(), then +1
     let ny = y, nm = m; // still 1-indexed
     if (nm === 12) { ny += 1; nm = 1; } else { nm += 1; }
     // Clamp day to actual days in target month

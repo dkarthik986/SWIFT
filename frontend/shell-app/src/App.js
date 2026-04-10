@@ -6,6 +6,7 @@ import Navbar from "./components/Navbar";
 import TabBar from "./components/TabBar";
 import MfeLoader from "./components/MfeLoader";
 import ErrorBoundary from "./components/ErrorBoundary";
+import QuickAccessMenu from "./components/QuickAccessMenu";
 import "./styles/global.css";
 import { applyTheme } from "./theme";
 
@@ -76,7 +77,13 @@ function AppRoutes() {
     <div className="shell-layout">
       <Navbar onOpenTab={openTab} appName={APP_NAME} />
       <div className="shell-content-area">
-        <TabBar tabs={tabs} activeTabId={activeTabId} onSwitch={switchTab} onClose={closeTab} />
+        <TabBar
+          tabs={tabs}
+          activeTabId={activeTabId}
+          onSwitch={switchTab}
+          onClose={closeTab}
+          rightSlot={<QuickAccessMenu onOpenTab={openTab} />}
+        />
         <main className="shell-main">
           {ActiveComponent && (
             <ErrorBoundary key={activeTab.id} mfeName={activeTab.label}>
