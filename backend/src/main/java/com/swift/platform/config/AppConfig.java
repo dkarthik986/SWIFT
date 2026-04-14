@@ -17,8 +17,11 @@ import org.springframework.context.annotation.Configuration;
 public class AppConfig {
 
     // ── MongoDB collections ────────────────────────────────────────────────
-    @Value("${mongo.collection.swift:jason_swift}")
+    @Value("${mongo.collection.swift:amp_messages}")
     private String swiftCollection;
+
+    @Value("${mongo.collection.payloads:amp_payloads}")
+    private String payloadsCollection;
 
     @Value("${mongo.collection.users:user_data}")
     private String usersCollection;
@@ -33,8 +36,29 @@ public class AppConfig {
     @Value("${search.max-page-size:500}")
     private int maxPageSize;
 
+    @Value("${search.metadata-cache-ttl-ms:300000}")
+    private long metadataCacheTtlMs;
+
+    @Value("${search.field-discovery-sample-size:200}")
+    private int fieldDiscoverySampleSize;
+
+    @Value("${search.payload-fetch-batch-size:1000}")
+    private int payloadFetchBatchSize;
+
+    @Value("${search.export-fetch-batch-size:5000}")
+    private int exportFetchBatchSize;
+
+    @Value("${search.optimize-without-lookup:true}")
+    private boolean optimizeWithoutLookup;
+
+    @Value("${search.ensure-indexes:true}")
+    private boolean ensureIndexes;
+
     @Value("${mongo.collection.rawcopies:amp_raw_copies}")
     private String rawCopiesCollection;
+
+    @Value("${mongo.collection.mt-labels:mt_lable}")
+    private String mtLabelsCollection;
 
     // ── Admin ─────────────────────────────────────────────────────────────
     @Value("${admin.protected-id:ADMIN001}")

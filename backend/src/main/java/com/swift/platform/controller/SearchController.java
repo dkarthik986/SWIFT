@@ -40,6 +40,31 @@ public class SearchController {
         return searchService.search(filters, page, size);
     }
 
+    @GetMapping("/api/search/export-all")
+    public List<SearchResponse> exportAll(@RequestParam Map<String, String> allParams,
+                                          HttpServletRequest httpReq) {
+        allParams.remove("page");
+        allParams.remove("size");
+
+        Map<String, String> filters = new HashMap<>();
+        allParams.forEach((k, v) -> { if (v != null && !v.isBlank()) filters.put(k, v); });
+
+        String employeeId = (String) httpReq.getAttribute("employeeId");
+        auditService.log(employeeId, "EXPORT_ALL", "Filters: " + filters, httpReq.getRemoteAddr());
+
+        return searchService.searchAllForExport(filters);
+    }
+
+    @GetMapping("/api/search/detail/by-reference/{reference}")
+    public SearchResponse messageDetail(@PathVariable String reference) {
+        return searchService.getMessageDetail(reference);
+    }
+
+    @PostMapping("/api/search/details/by-references")
+    public List<SearchResponse> messageDetails(@RequestBody List<String> references) {
+        return searchService.getMessageDetailsByReferences(references);
+    }
+
     @GetMapping("/api/dropdown-options")
     public DropdownOptionsResponse dropdownOptions() {
         return searchService.getDropdownOptions();

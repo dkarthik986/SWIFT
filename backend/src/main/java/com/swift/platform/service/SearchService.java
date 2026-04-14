@@ -6,552 +6,1447 @@ import com.swift.platform.dto.PagedResponse;
 import com.swift.platform.dto.SearchResponse;
 import lombok.RequiredArgsConstructor;
 import org.bson.Document;
-import org.springframework.data.domain.Sort;
 import org.springframework.data.mongodb.core.MongoTemplate;
-import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.stereotype.Service;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import com.mongodb.client.FindIterable;
 
-/**
- * SearchService — fully mapped for the flat "messages" collection (ampdb.messages).
- *
- * Schema verified against 100-document dataset. All top-level + mtPayload fields covered.
- *
- * TOP-LEVEL fields (direct document root):
- *   ampAmount, ampCurrency, ampDetailsOfCharges, ampRemittanceInformation, ampValueDate,
- *   backendChannel, backendChannelCode, backendChannelDescription,
- *   bulkSequenceNumber, bulkTotalMessages, bulkType,
- *   channelCode, channelProtocol, communicationType,
- *   currentStatus, dateCreated, dateReceived,
- *   digest2CheckResult, digestMCheckResult, direction,
- *   finAppId, finDirectionId, finLogicalTerminal, finMessagePriority, finMessageType,
- *   finReceiversAddress, finSequenceNumber, finServiceId, finSessionNumber,
- *   historyLines[], messageFamily, messageFormat, messageReference,
- *   messageTypeCode, messageTypeDescription, mtPayload{},
- *   networkChannel, networkPriority, originatorApplication, owner,
- *   pdeIndication, processPriority, processingType, profileCode, protocol,
- *   receiverAddress, receiverName, senderAddress, senderName, service,
- *   statusAction, statusChangeSource, statusDate, statusDecision,
- *   statusMessage, statusPhase, statusReason, transactionReference,
- *   workflow, workflowModel
- *
- * mtPayload nested fields:
- *   block1: applicationId, serviceId, logicalTerminalAddress, sessionNumber, sequenceNumber
- *   block2: directionId, messageType, messagePriority, receiverAddress
- *   block4Fields[]: tag, label, rawValue, components{}
- *   Flat extracted: transactionReference, bankOperationCode, currency, valueDate,
- *     interbankSettledAmount, instructedCurrency, instructedAmount,
- *     orderingCustomer, orderingInstitution, senderCorrespondent,
- *     accountWithInstitution, beneficiaryCustomer, remittanceInfo, detailsOfCharges,
- *     rawFin, fieldCount, payloadSize, payloadEncoding, digest, digestAlgorithm
- *
- * historyLines[]: index, historyDate, phase, action, reason, entity, channel, user, comment
- */
 @Service
 @RequiredArgsConstructor
 public class SearchService {
 
+    private static final String PAYLOAD_ALIAS = "payloadDoc";
+    private static final Set<String> LOOKUP_REQUIRED_PARAMS = Set.of(
+            "mur", "correspondent", "block4Tag", "block4Value", "freeSearchText"
+    );
+
+    private static final Set<String> HANDLED_PARAMS = Set.of(
+            "messageType", "messageCode", "io", "status", "phase", "action", "reason", "messagePriority",
+            "networkProtocol", "networkChannel", "networkPriority", "deliveryMode", "service",
+            "backendChannelProtocol", "backendChannelCode",
+            "owner", "workflow", "workflowModel", "originatorApplication", "sourceSystem",
+            "processingType", "processPriority", "profileCode",
+            "ccy", "sender", "receiver", "correspondent",
+            "possibleDuplicate", "digestMCheckResult", "digest2CheckResult",
+            "reference", "transactionReference", "transferReference", "relatedReference", "mur", "uetr",
+            "mxInputReference", "mxOutputReference", "networkReference", "e2eMessageId", "amlDetails",
+            "logicalTerminalAddress", "applicationId", "serviceId", "finReceiversAddress",
+            "startDate", "endDate", "valueDateFrom", "valueDateTo",
+            "statusDateFrom", "statusDateTo", "receivedDateFrom", "receivedDateTo",
+            "amountFrom", "amountTo", "seqFrom", "seqTo", "sessionNumber",
+            "historyEntity", "historyDescription", "historyPhase", "historyAction", "historyUser", "historyChannel",
+            "block4Tag", "block4Value", "freeSearchText", "page", "size"
+    );
+
+    private static final Map<String, String> FIN_TAG_LABELS = Map.ofEntries(
+            Map.entry("20", "Transaction Reference Number"),
+            Map.entry("21", "Related Reference"),
+            Map.entry("23B", "Bank Operation Code"),
+            Map.entry("32A", "Value Date / Currency / Interbank Settled Amount"),
+            Map.entry("33B", "Currency / Instructed Amount"),
+            Map.entry("50A", "Ordering Customer (BIC)"),
+            Map.entry("50F", "Ordering Customer (Structured)"),
+            Map.entry("50K", "Ordering Customer"),
+            Map.entry("52A", "Ordering Institution (BIC)"),
+            Map.entry("52D", "Ordering Institution"),
+            Map.entry("53A", "Sender's Correspondent (BIC)"),
+            Map.entry("53B", "Sender's Correspondent (Location)"),
+            Map.entry("53D", "Sender's Correspondent"),
+            Map.entry("56A", "Intermediary Institution (BIC)"),
+            Map.entry("57A", "Account With Institution (BIC)"),
+            Map.entry("57C", "Account With Institution (Account)"),
+            Map.entry("57D", "Account With Institution"),
+            Map.entry("59", "Beneficiary Customer"),
+            Map.entry("59A", "Beneficiary Customer (BIC)"),
+            Map.entry("70", "Remittance Information"),
+            Map.entry("71A", "Details of Charges"),
+            Map.entry("71F", "Sender's Charges"),
+            Map.entry("71G", "Receiver's Charges"),
+            Map.entry("72", "Sender to Receiver Information")
+    );
+
     private final MongoTemplate mongoTemplate;
-    private final AppConfig     appConfig;
+    private final AppConfig appConfig;
+    private volatile CachedValue<DropdownOptionsResponse> dropdownOptionsCache;
+    private volatile CachedValue<Long> unfilteredCountCache;
 
-    // ── Dropdown options ───────────────────────────────────────────────────
     public DropdownOptionsResponse getDropdownOptions() {
-        String col = appConfig.getSwiftCollection();
-        DropdownOptionsResponse res = new DropdownOptionsResponse();
+        CachedValue<DropdownOptionsResponse> cache = dropdownOptionsCache;
+        if (cache != null && !cache.isExpired(appConfig.getMetadataCacheTtlMs())) {
+            return cache.value();
+        }
 
-        // Classification
+        String messagesCol = appConfig.getSwiftCollection();
+        String payloadsCol = appConfig.getPayloadsCollection();
+
+        DropdownOptionsResponse res = new DropdownOptionsResponse();
         res.setFormats(Arrays.asList("MT", "MX"));
-        List<String> codes   = distinct("messageTypeCode", col);
-        List<String> mtCodes = codes.stream().filter(c -> c.toUpperCase().startsWith("MT")).sorted().collect(Collectors.toList());
-        List<String> mxCodes = codes.stream().filter(c -> !c.toUpperCase().startsWith("MT")).sorted().collect(Collectors.toList());
+
+        List<String> codes = distinctMerged(messagesCol, "messageTypeCode", "header.messageTypeCode");
+        List<String> mtCodes = codes.stream().filter(code -> code.toUpperCase().startsWith("MT")).sorted().collect(Collectors.toList());
+        List<String> mxCodes = codes.stream().filter(code -> !code.toUpperCase().startsWith("MT")).sorted().collect(Collectors.toList());
+
         res.setMessageCodes(codes);
         res.setTypes(codes);
         res.setMtTypes(mtCodes);
         res.setMxTypes(mxCodes);
         res.setAllMtMxTypes(Collections.emptyList());
-        res.setStatuses(distinct("currentStatus", col));
-        res.setPhases(distinct("statusPhase", col));
-        res.setActions(distinct("statusAction", col));
-        res.setIoDirections(distinct("direction", col));
-        res.setDirections(distinct("direction", col));
-        res.setReasons(distinct("statusReason", col));
 
-        // Network & routing
-        res.setNetworkProtocols(distinct("protocol", col));
-        res.setNetworks(distinct("protocol", col));
-        res.setNetworkChannels(distinct("networkChannel", col));
-        res.setBackendChannels(distinct("backendChannel", col));
-        res.setNetworkPriorities(distinct("networkPriority", col));
+        res.setStatuses(distinctMerged(messagesCol, "currentStatus", "status.current"));
+        res.setPhases(distinctMerged(messagesCol, "statusPhase", "status.phase"));
+        res.setActions(distinctMerged(messagesCol, "statusAction", "status.action"));
+        res.setIoDirections(distinctMerged(messagesCol, "direction", "header.direction"));
+        res.setDirections(distinctMerged(messagesCol, "direction", "header.direction"));
+        res.setReasons(distinctMerged(messagesCol, "statusReason", "status.reason"));
+
+        res.setNetworkProtocols(distinctMerged(messagesCol, "protocol", "header.protocol"));
+        res.setNetworks(distinctMerged(messagesCol, "protocol", "header.protocol"));
+        res.setNetworkChannels(distinctMerged(messagesCol, "networkChannel", "header.networkChannel"));
+        res.setBackendChannels(distinctMerged(messagesCol, "backendChannel", "header.backendChannel"));
+        res.setNetworkPriorities(distinctMerged(messagesCol, "networkPriority", "header.networkPriority"));
         res.setNetworkStatuses(Collections.emptyList());
-        res.setDeliveryModes(distinct("communicationType", col));
-        res.setServices(distinct("service", col));
+        res.setDeliveryModes(distinctMerged(messagesCol, "communicationType", "channel.communicationType"));
+        res.setServices(distinctMerged(messagesCol, "service", "header.service"));
 
-        // Parties
-        res.setSenders(distinct("senderAddress", col));
-        res.setReceivers(distinct("receiverAddress", col));
+        res.setSenders(distinctMerged(messagesCol, "senderAddress", "header.senderAddress"));
+        res.setReceivers(distinctMerged(messagesCol, "receiverAddress", "header.receiverAddress"));
         res.setCountries(Collections.emptyList());
         res.setOriginCountries(Collections.emptyList());
         res.setDestinationCountries(Collections.emptyList());
 
-        // Ownership & workflow
-        res.setOwners(distinct("owner", col));
-        res.setOwnerUnits(distinct("owner", col));
-        res.setWorkflows(distinct("workflow", col));
-        res.setWorkflowModels(distinct("workflowModel", col));
-        res.setSourceSystems(Collections.emptyList());
-        res.setOriginatorApplications(distinct("originatorApplication", col));
+        res.setOwners(distinctMerged(messagesCol, "owner", "header.owner"));
+        res.setOwnerUnits(distinctMerged(messagesCol, "owner", "header.owner"));
+        res.setWorkflows(distinctMerged(messagesCol, "workflow", "header.workflow"));
+        res.setWorkflowModels(distinctMerged(messagesCol, "workflowModel", "header.workflowModel"));
+        res.setSourceSystems(distinctMerged(messagesCol, "originatorApplication", "header.originatorApplication"));
+        res.setOriginatorApplications(distinctMerged(messagesCol, "originatorApplication", "header.originatorApplication"));
 
-        // Financial
-        res.setCurrencies(distinct("ampCurrency", col));
+        List<String> currencies = new ArrayList<>(distinctMerged(messagesCol, "ampCurrency", "extractedFields.currency"));
+        currencies.addAll(distinct(payloadsCol, "currency"));
+        res.setCurrencies(currencies.stream()
+                .filter(value -> value != null && !value.isBlank())
+                .collect(Collectors.toCollection(LinkedHashSet::new))
+                .stream().sorted().collect(Collectors.toList()));
 
-        // Processing
-        res.setProcessingTypes(distinct("processingType", col));
-        res.setProcessPriorities(distinct("processPriority", col));
-        res.setProfileCodes(distinct("profileCode", col));
+        res.setProcessingTypes(distinctMerged(messagesCol, "processingType", "header.processingType"));
+        res.setProcessPriorities(distinctMerged(messagesCol, "processPriority", "header.processPriority"));
+        res.setProfileCodes(distinctMerged(messagesCol, "profileCode", "header.profileCode"));
         res.setEnvironments(Collections.emptyList());
 
-        // AML / Compliance — not in this schema
         res.setAmlStatuses(Collections.emptyList());
         res.setFinCopies(Collections.emptyList());
         res.setFinCopyServices(Collections.emptyList());
-        res.setMessagePriorities(distinct("finMessagePriority", col));
+        res.setMessagePriorities(distinctMerged(messagesCol, "finMessagePriority", "protocolParams.messagePriority"));
         res.setNackCodes(Collections.emptyList());
         res.setCopyIndicators(Collections.emptyList());
 
+        dropdownOptionsCache = new CachedValue<>(res, System.currentTimeMillis());
         return res;
     }
 
-    private List<String> distinct(String fieldPath, String col) {
-        try {
-            return mongoTemplate.findDistinct(new Query(), fieldPath, col, String.class)
-                    .stream().filter(v -> v != null && !v.isBlank()).sorted().collect(Collectors.toList());
-        } catch (Exception e) { return Collections.emptyList(); }
-    }
-
-    // ── Search ─────────────────────────────────────────────────────────────
     public PagedResponse<SearchResponse> search(Map<String, String> filters, int page, int size) {
-        String col = appConfig.getSwiftCollection();
-        size = Math.min(size, appConfig.getMaxPageSize());
-        Query query = buildQuery(filters);
-        long total  = mongoTemplate.count(query, Document.class, col);
+        String messagesCol = appConfig.getSwiftCollection();
+        int pageSize = Math.min(size, appConfig.getMaxPageSize());
 
-        query.skip((long) page * size)
-                .limit(size)
-                .with(Sort.by(Sort.Direction.DESC, "dateCreated"));
+        int safePage = Math.max(page, 0);
+        SearchPlan plan = buildSearchPlan(filters);
 
-        List<Document> docs = mongoTemplate.find(query, Document.class, col);
-        List<SearchResponse> rows = docs.stream().map(this::toResponse).collect(Collectors.toList());
+        long total;
+        List<SearchResponse> rows;
+        if (appConfig.isOptimizeWithoutLookup() && !plan.requiresLookup()) {
+            total = countMessages(messagesCol, plan.messageMatch(), filters);
+            List<Document> docs = findMessagePage(messagesCol, plan.messageMatch(), safePage, pageSize);
+            Map<String, Document> payloadByReference = fetchPayloadsByReference(docs);
+            rows = docs.stream()
+                    .map(doc -> toSearchRowResponse(withPayloadDoc(doc, payloadByReference.get(stringValue(doc.get("messageReference"))))))
+                    .collect(Collectors.toList());
+        } else {
+            List<Document> basePipeline = buildLookupPipeline(plan);
+            total = aggregateCount(messagesCol, basePipeline, filters);
 
-        int totalPages = size > 0 ? (int) Math.ceil((double) total / size) : 0;
-        return new PagedResponse<>(rows, total, totalPages, page, size, page == 0, page >= totalPages - 1);
+            List<Document> rowsPipeline = new ArrayList<>(basePipeline);
+            rowsPipeline.add(new Document("$sort", new Document("header.dateCreated", -1).append("dateCreated", -1)));
+            rowsPipeline.add(new Document("$skip", (long) safePage * pageSize));
+            rowsPipeline.add(new Document("$limit", pageSize));
+
+            List<Document> docs = aggregate(messagesCol, rowsPipeline);
+            rows = docs.stream().map(this::toSearchRowResponse).collect(Collectors.toList());
+        }
+
+        int totalPages = pageSize > 0 ? (int) Math.ceil((double) total / pageSize) : 0;
+        return new PagedResponse<>(rows, total, totalPages, safePage, pageSize, safePage == 0, safePage >= totalPages - 1);
     }
 
-    // ── Query builder ──────────────────────────────────────────────────────
-    private Query buildQuery(Map<String, String> f) {
-        List<Criteria> criteria = new ArrayList<>();
+    public List<SearchResponse> searchAllForExport(Map<String, String> filters) {
+        String messagesCol = appConfig.getSwiftCollection();
+        SearchPlan plan = buildSearchPlan(filters);
 
-        // ── Classification ─────────────────────────────────────────────────
-        exactIf(criteria, f, "messageType",     "messageFamily");
-        exactIf(criteria, f, "messageCode",     "messageTypeCode");
-        exactIf(criteria, f, "io",              "direction");
-        exactIf(criteria, f, "status",          "currentStatus");
-        exactIf(criteria, f, "phase",           "statusPhase");
-        exactIf(criteria, f, "action",          "statusAction");
-        exactIf(criteria, f, "reason",          "statusReason");
-        exactIf(criteria, f, "messagePriority", "finMessagePriority");
+        if (appConfig.isOptimizeWithoutLookup() && !plan.requiresLookup()) {
+            List<SearchResponse> results = new ArrayList<>();
+            List<Document> batch = new ArrayList<>();
+            int batchSize = Math.max(1, appConfig.getExportFetchBatchSize());
 
-        // ── Network / routing ───────────────────────────────────────────────
-        exactIf(criteria, f, "networkProtocol", "protocol");
-        exactIf(criteria, f, "networkChannel",  "networkChannel");
-        exactIf(criteria, f, "networkPriority", "networkPriority");
-        exactIf(criteria, f, "deliveryMode",    "communicationType");
-        exactIf(criteria, f, "service",         "service");
-        exactIf(criteria, f, "backendChannelProtocol", "channelProtocol");
-        exactIf(criteria, f, "backendChannelCode",     "backendChannelCode");
+            FindIterable<Document> iterable = mongoTemplate.getCollection(messagesCol)
+                    .find(plan.messageMatch().isEmpty() ? new Document() : plan.messageMatch())
+                    .sort(new Document("header.dateCreated", -1).append("dateCreated", -1))
+                    .batchSize(batchSize);
 
-        // ── Ownership / processing ──────────────────────────────────────────
-        exactIf(criteria, f, "owner",                 "owner");
-        exactIf(criteria, f, "workflow",               "workflow");
-        exactIf(criteria, f, "workflowModel",          "workflowModel");
-        exactIf(criteria, f, "originatorApplication",  "originatorApplication");
-        exactIf(criteria, f, "processingType",         "processingType");
-        exactIf(criteria, f, "processPriority",        "processPriority");
-        exactIf(criteria, f, "profileCode",            "profileCode");
-
-        // ── Financial ───────────────────────────────────────────────────────
-        exactIf(criteria, f, "ccy", "ampCurrency");
-
-        // ── Parties (exact BIC match) ───────────────────────────────────────
-        exactIf(criteria, f, "sender",   "senderAddress");
-        exactIf(criteria, f, "receiver", "receiverAddress");
-
-        // ── PDE / duplicate flag (stored as "true"/"false" string) ──────────
-        String pde = f.get("possibleDuplicate");
-        if (notBlank(pde)) criteria.add(Criteria.where("pdeIndication").is(pde.toLowerCase()));
-
-        // ── Digest check results ────────────────────────────────────────────
-        exactIf(criteria, f, "digestMCheckResult", "digestMCheckResult");
-        exactIf(criteria, f, "digest2CheckResult", "digest2CheckResult");
-
-        // ── Regex (partial match) ───────────────────────────────────────────
-        regexIf(criteria, f, "reference",            "messageReference");
-        regexIf(criteria, f, "transactionReference", "transactionReference");
-        regexIf(criteria, f, "mur",                  "mtPayload.transactionReference");
-        regexIf(criteria, f, "networkReference",     "networkReference");
-        regexIf(criteria, f, "e2eMessageId",         "e2eMessageId");
-        regexIf(criteria, f, "amlDetails",           "amlDetails");
-        // FIN header text search
-        regexIf(criteria, f, "logicalTerminalAddress", "finLogicalTerminal");
-        regexIf(criteria, f, "applicationId",          "finAppId");
-        regexIf(criteria, f, "serviceId",              "finServiceId");
-        regexIf(criteria, f, "finReceiversAddress",    "finReceiversAddress");
-
-        // ── Date ranges ─────────────────────────────────────────────────────
-        // Creation date  → dateCreated
-        dateRangeIf(criteria, f, "startDate",        "endDate",        "dateCreated");
-        // Value date     → ampValueDate
-        dateRangeIf(criteria, f, "valueDateFrom",    "valueDateTo",    "ampValueDate");
-        // Status date    → statusDate
-        dateRangeIf(criteria, f, "statusDateFrom",   "statusDateTo",   "statusDate");
-        // Received date  → dateReceived
-        dateRangeIf(criteria, f, "receivedDateFrom", "receivedDateTo", "dateReceived");
-
-        // ── Amount range — ampAmount stored as String, use $expr $toDouble ───
-        String amtFrom = f.get("amountFrom"), amtTo = f.get("amountTo");
-        if (notBlank(amtFrom) || notBlank(amtTo)) {
-            try {
-                List<Document> andConds = new ArrayList<>();
-                if (notBlank(amtFrom)) andConds.add(new Document("$gte",
-                        Arrays.asList(new Document("$toDouble", "$ampAmount"), Double.parseDouble(amtFrom))));
-                if (notBlank(amtTo))   andConds.add(new Document("$lte",
-                        Arrays.asList(new Document("$toDouble", "$ampAmount"), Double.parseDouble(amtTo))));
-                Object exprVal = andConds.size() == 1 ? andConds.get(0) : new Document("$and", andConds);
-                criteria.add(new Criteria() {
-                    @Override public Document getCriteriaObject() { return new Document("$expr", exprVal); }
-                });
-            } catch (NumberFormatException ignored) {}
+            for (Document doc : iterable) {
+                batch.add(doc);
+                if (batch.size() >= batchSize) {
+                    appendExportBatch(results, batch);
+                    batch.clear();
+                }
+            }
+            if (!batch.isEmpty()) {
+                appendExportBatch(results, batch);
+            }
+            return results;
         }
 
-        // ── Sequence number range — finSequenceNumber stored as String ────────
-        String seqFrom = f.get("seqFrom"), seqTo = f.get("seqTo");
-        if (notBlank(seqFrom) || notBlank(seqTo)) {
-            try {
-                List<Document> andConds = new ArrayList<>();
-                if (notBlank(seqFrom)) andConds.add(new Document("$gte",
-                        Arrays.asList(new Document("$toInt", "$finSequenceNumber"), Integer.parseInt(seqFrom.trim()))));
-                if (notBlank(seqTo))   andConds.add(new Document("$lte",
-                        Arrays.asList(new Document("$toInt", "$finSequenceNumber"), Integer.parseInt(seqTo.trim()))));
-                Object exprVal = andConds.size() == 1 ? andConds.get(0) : new Document("$and", andConds);
-                criteria.add(new Criteria() {
-                    @Override public Document getCriteriaObject() { return new Document("$expr", exprVal); }
-                });
-            } catch (NumberFormatException ignored) {}
+        List<Document> docs = aggregate(messagesCol, buildLookupPipeline(plan));
+        return docs.stream().map(this::toResponse).collect(Collectors.toList());
+    }
+
+    public SearchResponse getMessageDetail(String reference) {
+        if (!notBlank(reference)) {
+            return null;
+        }
+        Document match = new Document("$or", List.of(
+                new Document("messageReference", reference),
+                new Document("header.messageReference", reference)
+        ));
+        List<Document> pipeline = buildLookupPipeline(new SearchPlan(match, new Document(), true));
+        pipeline.add(new Document("$limit", 1));
+        List<Document> docs = aggregate(appConfig.getSwiftCollection(), pipeline);
+        return docs.isEmpty() ? null : toResponse(docs.get(0));
+    }
+
+    public List<SearchResponse> getMessageDetailsByReferences(List<String> references) {
+        List<String> uniqueReferences = references == null ? Collections.emptyList() : references.stream()
+                .filter(this::notBlank)
+                .distinct()
+                .collect(Collectors.toList());
+        if (uniqueReferences.isEmpty()) {
+            return Collections.emptyList();
         }
 
-        // ── historyLines search (top-level array, confirmed in 100-doc dataset)
-        // Each entry: { index, historyDate, phase, action, reason, entity, channel, user, comment }
-        String he = f.get("historyEntity");
-        if (notBlank(he)) criteria.add(
-                Criteria.where("historyLines").elemMatch(Criteria.where("entity").regex(escapeRegex(he), "i")));
-        String hd = f.get("historyDescription");
-        if (notBlank(hd)) criteria.add(
-                Criteria.where("historyLines").elemMatch(Criteria.where("comment").regex(escapeRegex(hd), "i")));
-        String hphase = f.get("historyPhase");
-        if (notBlank(hphase)) criteria.add(
-                Criteria.where("historyLines").elemMatch(Criteria.where("phase").is(hphase)));
-        String haction = f.get("historyAction");
-        if (notBlank(haction)) criteria.add(
-                Criteria.where("historyLines").elemMatch(Criteria.where("action").is(haction)));
-        String huser = f.get("historyUser");
-        if (notBlank(huser)) criteria.add(
-                Criteria.where("historyLines").elemMatch(Criteria.where("user").regex(escapeRegex(huser), "i")));
-        String hchannel = f.get("historyChannel");
-        if (notBlank(hchannel)) criteria.add(
-                Criteria.where("historyLines").elemMatch(Criteria.where("channel").regex(escapeRegex(hchannel), "i")));
+        List<Document> messageDocs = mongoTemplate.getCollection(appConfig.getSwiftCollection())
+                .find(new Document("messageReference", new Document("$in", uniqueReferences)))
+                .into(new ArrayList<>());
+        Map<String, Document> payloadByReference = fetchPayloadsByReference(messageDocs);
+        return messageDocs.stream()
+                .map(doc -> toResponse(withPayloadDoc(doc, payloadByReference.get(stringValue(doc.get("messageReference"))))))
+                .collect(Collectors.toList());
+    }
 
-        // ── block4Fields tag search (mtPayload.block4Fields[]) ─────────────────
-        String tag = f.get("block4Tag"), tagVal = f.get("block4Value");
-        if (notBlank(tag) && notBlank(tagVal)) {
-            criteria.add(Criteria.where("mtPayload.block4Fields").elemMatch(
-                    Criteria.where("tag").is(tag).and("rawValue").regex(escapeRegex(tagVal), "i")));
-        } else if (notBlank(tagVal)) {
-            criteria.add(Criteria.where("mtPayload.block4Fields").elemMatch(
-                    Criteria.where("rawValue").regex(escapeRegex(tagVal), "i")));
+    private List<Document> buildLookupPipeline(SearchPlan plan) {
+        List<Document> pipeline = new ArrayList<>();
+        pipeline.add(new Document("$lookup",
+                new Document("from", appConfig.getPayloadsCollection())
+                        .append("localField", "messageReference")
+                        .append("foreignField", "messageReference")
+                        .append("as", PAYLOAD_ALIAS)
+        ));
+        pipeline.add(new Document("$unwind",
+                new Document("path", "$" + PAYLOAD_ALIAS)
+                        .append("preserveNullAndEmptyArrays", true)
+        ));
+
+        if (!plan.messageMatch().isEmpty()) {
+            pipeline.add(new Document("$match", plan.messageMatch()));
         }
-
-        // ── Free text search ────────────────────────────────────────────────
-        String ft = f.get("freeSearchText");
-        if (notBlank(ft)) {
-            String rx = escapeRegex(ft);
-            criteria.add(new Criteria().orOperator(
-                    Criteria.where("messageReference").regex(rx, "i"),
-                    Criteria.where("transactionReference").regex(rx, "i"),
-                    Criteria.where("senderAddress").regex(rx, "i"),
-                    Criteria.where("receiverAddress").regex(rx, "i"),
-                    Criteria.where("senderName").regex(rx, "i"),
-                    Criteria.where("receiverName").regex(rx, "i"),
-                    Criteria.where("owner").regex(rx, "i"),
-                    Criteria.where("workflow").regex(rx, "i"),
-                    Criteria.where("currentStatus").regex(rx, "i"),
-                    Criteria.where("statusMessage").regex(rx, "i"),
-                    // Bug #3 fix: dot notation does not match array elements in MongoDB.
-                    // elemMatch must be used to query inside historyLines[].
-                    new Criteria().andOperator(
-                        Criteria.where("historyLines").elemMatch(
-                            new Criteria().orOperator(
-                                Criteria.where("comment").regex(rx, "i"),
-                                Criteria.where("entity").regex(rx, "i")
-                            )
-                        )
-                    ),
-                    Criteria.where("mtPayload.transactionReference").regex(rx, "i"),
-                    Criteria.where("mtPayload.block4Fields.rawValue").regex(rx, "i"),
-                    Criteria.where("mtPayload.orderingCustomer").regex(rx, "i"),
-                    Criteria.where("mtPayload.beneficiaryCustomer").regex(rx, "i")
-            ));
+        if (!plan.postLookupMatch().isEmpty()) {
+            pipeline.add(new Document("$match", plan.postLookupMatch()));
         }
+        return pipeline;
+    }
 
-        // ── Dynamic catch-all ───────────────────────────────────────────────
-        // Any unrecognised param → exact match on the top-level field directly
-        Set<String> handledParams = Set.of(
-                "messageType","messageCode","io","status","phase","action","reason","messagePriority",
-                "networkProtocol","networkChannel","networkPriority","deliveryMode","service",
-                "backendChannelProtocol","backendChannelCode",
-                "owner","workflow","workflowModel","originatorApplication",
-                "processingType","processPriority","profileCode","ccy",
-                "sender","receiver","possibleDuplicate","digestMCheckResult","digest2CheckResult",
-                "reference","transactionReference","mur","networkReference","e2eMessageId","amlDetails",
-                "logicalTerminalAddress","applicationId","serviceId","finReceiversAddress",
-                "startDate","endDate","valueDateFrom","valueDateTo",
-                "statusDateFrom","statusDateTo","receivedDateFrom","receivedDateTo",
-                "amountFrom","amountTo","seqFrom","seqTo",
-                "historyEntity","historyDescription","historyPhase","historyAction","historyUser","historyChannel",
-                "block4Tag","block4Value","freeSearchText","page","size"
-        );
-        f.forEach((param, value) -> {
-            if (!handledParams.contains(param) && notBlank(value)) {
-                criteria.add(Criteria.where(param).is(value));
+    private SearchPlan buildSearchPlan(Map<String, String> filters) {
+        boolean requiresLookup = requiresPayloadLookup(filters);
+        if (!requiresLookup) {
+            return new SearchPlan(buildMessageOnlyMatch(filters), new Document(), false);
+        }
+        return new SearchPlan(buildMessageOnlyMatch(filters), buildMatch(filters), true);
+    }
+
+    private boolean requiresPayloadLookup(Map<String, String> filters) {
+        if (filters == null || filters.isEmpty()) {
+            return false;
+        }
+        return filters.keySet().stream().anyMatch(param -> LOOKUP_REQUIRED_PARAMS.contains(param) || !HANDLED_PARAMS.contains(param));
+    }
+
+    private Document buildMessageOnlyMatch(Map<String, String> filters) {
+        List<Document> clauses = new ArrayList<>();
+
+        exactIfAny(clauses, filters, "messageType", "messageFamily");
+        exactIfAny(clauses, filters, "messageCode", "messageTypeCode", "header.messageTypeCode");
+        exactIfAny(clauses, filters, "io", "direction", "header.direction");
+        exactIfAny(clauses, filters, "status", "currentStatus", "status.current");
+        exactIfAny(clauses, filters, "phase", "statusPhase", "status.phase");
+        exactIfAny(clauses, filters, "action", "statusAction", "status.action");
+        exactIfAny(clauses, filters, "reason", "statusReason", "status.reason");
+        exactIfAny(clauses, filters, "messagePriority", "finMessagePriority", "protocolParams.messagePriority");
+
+        exactIfAny(clauses, filters, "networkProtocol", "protocol", "header.protocol");
+        exactIfAny(clauses, filters, "networkChannel", "networkChannel", "header.networkChannel", "header.backendChannel");
+        exactIfAny(clauses, filters, "networkPriority", "networkPriority", "header.networkPriority");
+        exactIfAny(clauses, filters, "deliveryMode", "communicationType", "channel.communicationType");
+        exactIfAny(clauses, filters, "service", "service", "header.service");
+        exactIfAny(clauses, filters, "backendChannelProtocol", "channelProtocol", "channel.protocol");
+        exactIfAny(clauses, filters, "backendChannelCode", "backendChannelCode", "channel.backendChannelCode");
+
+        exactIfAny(clauses, filters, "owner", "owner", "header.owner");
+        exactIfAny(clauses, filters, "workflow", "workflow", "header.workflow");
+        exactIfAny(clauses, filters, "workflowModel", "workflowModel", "header.workflowModel");
+        exactIfAny(clauses, filters, "originatorApplication", "originatorApplication", "header.originatorApplication");
+        exactIfAny(clauses, filters, "sourceSystem", "originatorApplication", "header.originatorApplication");
+        exactIfAny(clauses, filters, "processingType", "processingType", "header.processingType");
+        exactIfAny(clauses, filters, "processPriority", "processPriority", "header.processPriority");
+        exactIfAny(clauses, filters, "profileCode", "profileCode", "header.profileCode");
+
+        exactIfAny(clauses, filters, "ccy", "ampCurrency", "extractedFields.currency");
+        exactIfAny(clauses, filters, "sender", "senderAddress", "header.senderAddress");
+        exactIfAny(clauses, filters, "receiver", "receiverAddress", "header.receiverAddress");
+
+        booleanIfAny(clauses, filters, "possibleDuplicate", "pdeIndication", "header.pdeIndication");
+        booleanIfAny(clauses, filters, "digestMCheckResult", "digestMCheckResult", "protocolParams.digestMCheckResult");
+        booleanIfAny(clauses, filters, "digest2CheckResult", "digest2CheckResult", "protocolParams.digest2CheckResult");
+
+        exactIfAny(clauses, filters, "reference", "messageReference", "header.messageReference");
+        exactIfAny(clauses, filters, "transactionReference", "transactionReference", "header.transactionReference");
+        exactIfAny(clauses, filters, "transferReference", "transferReference");
+        exactIfAny(clauses, filters, "relatedReference", "relatedReference");
+        exactIfAny(clauses, filters, "uetr", "uetr");
+        exactIfAny(clauses, filters, "mxInputReference", "mxInputReference");
+        exactIfAny(clauses, filters, "mxOutputReference", "mxOutputReference");
+        exactIfAny(clauses, filters, "networkReference", "networkReference");
+        regexIfAny(clauses, filters, "e2eMessageId", "e2eMessageId");
+        regexIfAny(clauses, filters, "amlDetails", "amlDetails");
+
+        exactIfAny(clauses, filters, "logicalTerminalAddress", "finLogicalTerminal", "protocolParams.logicalTerminal");
+        exactIfAny(clauses, filters, "applicationId", "finAppId", "protocolParams.appId");
+        exactIfAny(clauses, filters, "serviceId", "finServiceId", "protocolParams.serviceId");
+        exactIfAny(clauses, filters, "sessionNumber", "finSessionNumber", "protocolParams.sessionNumber");
+        exactIfAny(clauses, filters, "finReceiversAddress", "finReceiversAddress", "protocolParams.receiversAddress");
+
+        dateRangeIfAny(clauses, filters, "startDate", "endDate", "dateCreated", "header.dateCreated");
+        dateRangeIfAny(clauses, filters, "valueDateFrom", "valueDateTo", "ampValueDate", "extractedFields.valueDate");
+        dateRangeIfAny(clauses, filters, "statusDateFrom", "statusDateTo", "statusDate", "status.date");
+        dateRangeIfAny(clauses, filters, "receivedDateFrom", "receivedDateTo", "dateReceived", "header.dateReceived");
+
+        numericRangeIf(clauses, filters, "amountFrom", "amountTo", false, "ampAmount", "extractedFields.amount");
+        numericRangeIf(clauses, filters, "seqFrom", "seqTo", true, "finSequenceNumber", "protocolParams.sequenceNumber");
+
+        addHistoryFilters(clauses, filters);
+
+        if (clauses.isEmpty()) {
+            return new Document();
+        }
+        return new Document("$and", clauses);
+    }
+
+    private Document buildMatch(Map<String, String> filters) {
+        List<Document> clauses = new ArrayList<>();
+
+        exactIfAny(clauses, filters, "messageType", "messageFamily");
+        exactIfAny(clauses, filters, "messageCode", "messageTypeCode", "header.messageTypeCode");
+        exactIfAny(clauses, filters, "io", "direction", "header.direction");
+        exactIfAny(clauses, filters, "status", "currentStatus", "status.current");
+        exactIfAny(clauses, filters, "phase", "statusPhase", "status.phase");
+        exactIfAny(clauses, filters, "action", "statusAction", "status.action");
+        exactIfAny(clauses, filters, "reason", "statusReason", "status.reason");
+        exactIfAny(clauses, filters, "messagePriority", "finMessagePriority", "protocolParams.messagePriority");
+
+        exactIfAny(clauses, filters, "networkProtocol", "protocol", "header.protocol");
+        exactIfAny(clauses, filters, "networkChannel", "networkChannel", "header.networkChannel", "header.backendChannel");
+        exactIfAny(clauses, filters, "networkPriority", "networkPriority", "header.networkPriority");
+        exactIfAny(clauses, filters, "deliveryMode", "communicationType", "channel.communicationType");
+        exactIfAny(clauses, filters, "service", "service", "header.service");
+        exactIfAny(clauses, filters, "backendChannelProtocol", "channelProtocol", "channel.protocol");
+        exactIfAny(clauses, filters, "backendChannelCode", "backendChannelCode", "channel.backendChannelCode");
+
+        exactIfAny(clauses, filters, "owner", "owner", "header.owner");
+        exactIfAny(clauses, filters, "workflow", "workflow", "header.workflow");
+        exactIfAny(clauses, filters, "workflowModel", "workflowModel", "header.workflowModel");
+        exactIfAny(clauses, filters, "originatorApplication", "originatorApplication", "header.originatorApplication");
+        exactIfAny(clauses, filters, "sourceSystem", "originatorApplication", "header.originatorApplication");
+        exactIfAny(clauses, filters, "processingType", "processingType", "header.processingType");
+        exactIfAny(clauses, filters, "processPriority", "processPriority", "header.processPriority");
+        exactIfAny(clauses, filters, "profileCode", "profileCode", "header.profileCode");
+
+        exactIfAny(clauses, filters, "ccy", "ampCurrency", "extractedFields.currency", PAYLOAD_ALIAS + ".currency");
+
+        exactIfAny(clauses, filters, "sender", "senderAddress", "header.senderAddress", PAYLOAD_ALIAS + ".senderAddress");
+        exactIfAny(clauses, filters, "receiver", "receiverAddress", "header.receiverAddress", PAYLOAD_ALIAS + ".receiverAddress");
+        regexIfAny(clauses, filters, "correspondent", "correspondent", PAYLOAD_ALIAS + ".senderCorrespondent");
+
+        booleanIfAny(clauses, filters, "possibleDuplicate", "pdeIndication", "header.pdeIndication");
+        booleanIfAny(clauses, filters, "digestMCheckResult", "digestMCheckResult", "protocolParams.digestMCheckResult");
+        booleanIfAny(clauses, filters, "digest2CheckResult", "digest2CheckResult", "protocolParams.digest2CheckResult");
+
+        exactIfAny(clauses, filters, "reference", "messageReference", "header.messageReference");
+        exactIfAny(clauses, filters, "transactionReference", "transactionReference", "header.transactionReference");
+        exactIfAny(clauses, filters, "transferReference", "transferReference");
+        exactIfAny(clauses, filters, "relatedReference", "relatedReference");
+        regexIfAny(clauses, filters, "mur", "mtPayload.transactionReference", PAYLOAD_ALIAS + ".mtParsedPayload.transactionReference");
+        exactIfAny(clauses, filters, "uetr", "uetr");
+        exactIfAny(clauses, filters, "mxInputReference", "mxInputReference");
+        exactIfAny(clauses, filters, "mxOutputReference", "mxOutputReference");
+        exactIfAny(clauses, filters, "networkReference", "networkReference");
+        regexIfAny(clauses, filters, "e2eMessageId", "e2eMessageId");
+        regexIfAny(clauses, filters, "amlDetails", "amlDetails");
+
+        exactIfAny(clauses, filters, "logicalTerminalAddress",
+                "finLogicalTerminal", "protocolParams.logicalTerminal", PAYLOAD_ALIAS + ".mtParsedPayload.block1.logicalTerminalAddress");
+        exactIfAny(clauses, filters, "applicationId",
+                "finAppId", "protocolParams.appId", PAYLOAD_ALIAS + ".mtParsedPayload.block1.applicationId");
+        exactIfAny(clauses, filters, "serviceId",
+                "finServiceId", "protocolParams.serviceId", PAYLOAD_ALIAS + ".mtParsedPayload.block1.serviceId");
+        exactIfAny(clauses, filters, "sessionNumber",
+                "finSessionNumber", "protocolParams.sessionNumber", PAYLOAD_ALIAS + ".mtParsedPayload.block1.sessionNumber");
+        exactIfAny(clauses, filters, "finReceiversAddress",
+                "finReceiversAddress", "protocolParams.receiversAddress", PAYLOAD_ALIAS + ".mtParsedPayload.block2.receiverAddress");
+
+        dateRangeIfAny(clauses, filters, "startDate", "endDate", "dateCreated", "header.dateCreated");
+        dateRangeIfAny(clauses, filters, "valueDateFrom", "valueDateTo", "ampValueDate", "extractedFields.valueDate");
+        dateRangeIfAny(clauses, filters, "statusDateFrom", "statusDateTo", "statusDate", "status.date");
+        dateRangeIfAny(clauses, filters, "receivedDateFrom", "receivedDateTo", "dateReceived", "header.dateReceived");
+
+        numericRangeIf(clauses, filters, "amountFrom", "amountTo",
+                false, "ampAmount", "extractedFields.amount", PAYLOAD_ALIAS + ".amount");
+        numericRangeIf(clauses, filters, "seqFrom", "seqTo",
+                true, "finSequenceNumber", "protocolParams.sequenceNumber", PAYLOAD_ALIAS + ".mtParsedPayload.block1.sequenceNumber");
+
+        addHistoryFilters(clauses, filters);
+        addPayloadFilters(clauses, filters);
+        addFreeTextFilter(clauses, filters);
+
+        filters.forEach((param, value) -> {
+            if (!HANDLED_PARAMS.contains(param) && notBlank(value)) {
+                clauses.add(buildDynamicClause(param, value));
             }
         });
 
-        if (criteria.isEmpty()) return new Query();
-        return new Query(new Criteria().andOperator(criteria.toArray(new Criteria[0])));
+        if (clauses.isEmpty()) {
+            return new Document();
+        }
+        return new Document("$and", clauses);
     }
 
-    private void exactIf(List<Criteria> l, Map<String,String> f, String paramKey, String dbField) {
-        String v = f.get(paramKey);
-        if (notBlank(v)) l.add(Criteria.where(dbField).is(v));
-    }
-    private void regexIf(List<Criteria> l, Map<String,String> f, String paramKey, String dbField) {
-        String v = f.get(paramKey);
-        if (notBlank(v)) l.add(Criteria.where(dbField).regex(escapeRegex(v), "i"));
-    }
-    private void dateRangeIf(List<Criteria> l, Map<String,String> f, String fromKey, String toKey, String field) {
-        String sd = f.get(fromKey), ed = f.get(toKey);
-        if (notBlank(sd) && notBlank(ed))   l.add(Criteria.where(field).gte(sd).lte(ed + "T23:59:59Z"));
-        else if (notBlank(sd))              l.add(Criteria.where(field).gte(sd));
-        else if (notBlank(ed))              l.add(Criteria.where(field).lte(ed + "T23:59:59Z"));
-    }
-    private boolean notBlank(String v)    { return v != null && !v.isBlank(); }
-    private String  escapeRegex(String s) { return s.replaceAll("[\\\\^$.|?*+()\\[\\]{}]", "\\\\$0"); }
+    private void addHistoryFilters(List<Document> clauses, Map<String, String> filters) {
+        String historyEntity = filters.get("historyEntity");
+        if (notBlank(historyEntity)) {
+            clauses.add(new Document("historyLines",
+                    new Document("$elemMatch", regexCondition("entity", historyEntity))));
+        }
 
-    // ── Document → SearchResponse ──────────────────────────────────────────
-    @SuppressWarnings("unchecked")
+        String historyDescription = filters.get("historyDescription");
+        if (notBlank(historyDescription)) {
+            clauses.add(new Document("historyLines",
+                    new Document("$elemMatch", regexCondition("comment", historyDescription))));
+        }
+
+        String historyPhase = filters.get("historyPhase");
+        if (notBlank(historyPhase)) {
+            clauses.add(new Document("historyLines",
+                    new Document("$elemMatch", new Document("phase", historyPhase))));
+        }
+
+        String historyAction = filters.get("historyAction");
+        if (notBlank(historyAction)) {
+            clauses.add(new Document("historyLines",
+                    new Document("$elemMatch", new Document("action", historyAction))));
+        }
+
+        String historyUser = filters.get("historyUser");
+        if (notBlank(historyUser)) {
+            clauses.add(new Document("historyLines",
+                    new Document("$elemMatch", regexCondition("user", historyUser))));
+        }
+
+        String historyChannel = filters.get("historyChannel");
+        if (notBlank(historyChannel)) {
+            clauses.add(new Document("historyLines",
+                    new Document("$elemMatch", regexCondition("channel", historyChannel))));
+        }
+    }
+
+    private void addPayloadFilters(List<Document> clauses, Map<String, String> filters) {
+        String tag = filters.get("block4Tag");
+        String value = filters.get("block4Value");
+
+        if (notBlank(tag)) {
+            clauses.add(regexClause(PAYLOAD_ALIAS + ".mtParsedPayload.rawBlock4", ":" + tag + ":"));
+        }
+
+        if (notBlank(value)) {
+            clauses.add(new Document("$or", Arrays.asList(
+                    new Document("mtPayload.block4Fields",
+                            new Document("$elemMatch", regexCondition("rawValue", value))),
+                    regexClause(PAYLOAD_ALIAS + ".mtParsedPayload.rawBlock4", value),
+                    regexClause(PAYLOAD_ALIAS + ".mtParsedPayload.rawFields._raw", value)
+            )));
+        }
+    }
+
+    private void addFreeTextFilter(List<Document> clauses, Map<String, String> filters) {
+        String freeText = filters.get("freeSearchText");
+        if (!notBlank(freeText)) {
+            return;
+        }
+
+        List<Document> orClauses = new ArrayList<>(Arrays.asList(
+                regexClause("messageReference", freeText),
+                regexClause("header.messageReference", freeText),
+                regexClause("transactionReference", freeText),
+                regexClause("header.transactionReference", freeText),
+                regexClause("senderAddress", freeText),
+                regexClause("header.senderAddress", freeText),
+                regexClause("receiverAddress", freeText),
+                regexClause("header.receiverAddress", freeText),
+                regexClause("senderName", freeText),
+                regexClause("header.senderName", freeText),
+                regexClause("receiverName", freeText),
+                regexClause("header.receiverName", freeText),
+                regexClause("owner", freeText),
+                regexClause("header.owner", freeText),
+                regexClause("workflow", freeText),
+                regexClause("header.workflow", freeText),
+                regexClause("currentStatus", freeText),
+                regexClause("status.current", freeText),
+                regexClause("statusMessage", freeText),
+                regexClause("status.message", freeText),
+                regexClause("body.rawPayload", freeText),
+                regexClause(PAYLOAD_ALIAS + ".mtParsedPayload.transactionReference", freeText),
+                regexClause(PAYLOAD_ALIAS + ".mtParsedPayload.rawBlock4", freeText),
+                regexClause(PAYLOAD_ALIAS + ".orderingCustomer", freeText),
+                regexClause(PAYLOAD_ALIAS + ".beneficiaryCustomer", freeText),
+                regexClause(PAYLOAD_ALIAS + ".remittanceInfo", freeText)
+        ));
+
+        orClauses.add(new Document("historyLines",
+                new Document("$elemMatch",
+                        new Document("$or", Arrays.asList(
+                                regexCondition("comment", freeText),
+                                regexCondition("entity", freeText)
+                        )))));
+
+        clauses.add(new Document("$or", orClauses));
+    }
+
+    private void exactIfAny(List<Document> clauses, Map<String, String> filters, String paramKey, String... fieldPaths) {
+        String value = filters.get(paramKey);
+        if (!notBlank(value)) {
+            return;
+        }
+        clauses.add(fieldPaths.length == 1
+                ? new Document(fieldPaths[0], value)
+                : new Document("$or", Arrays.stream(fieldPaths).map(path -> new Document(path, value)).collect(Collectors.toList())));
+    }
+
+    private void regexIfAny(List<Document> clauses, Map<String, String> filters, String paramKey, String... fieldPaths) {
+        String value = filters.get(paramKey);
+        if (!notBlank(value)) {
+            return;
+        }
+        clauses.add(fieldPaths.length == 1
+                ? regexClause(fieldPaths[0], value)
+                : new Document("$or", Arrays.stream(fieldPaths).map(path -> regexClause(path, value)).collect(Collectors.toList())));
+    }
+
+    private void booleanIfAny(List<Document> clauses, Map<String, String> filters, String paramKey, String... fieldPaths) {
+        String value = filters.get(paramKey);
+        if (!notBlank(value)) {
+            return;
+        }
+
+        boolean boolValue = Boolean.parseBoolean(value);
+        List<Document> orClauses = new ArrayList<>();
+        for (String fieldPath : fieldPaths) {
+            orClauses.add(new Document(fieldPath, boolValue));
+            orClauses.add(new Document(fieldPath, String.valueOf(boolValue)));
+            orClauses.add(new Document(fieldPath, value));
+        }
+        clauses.add(new Document("$or", orClauses));
+    }
+
+    private void dateRangeIfAny(List<Document> clauses, Map<String, String> filters,
+                                String fromKey, String toKey, String... fieldPaths) {
+        String from = filters.get(fromKey);
+        String to = filters.get(toKey);
+        if (!notBlank(from) && !notBlank(to)) {
+            return;
+        }
+
+        List<Document> pathClauses = new ArrayList<>();
+        for (String fieldPath : fieldPaths) {
+            Document range = new Document();
+            if (notBlank(from)) {
+                range.append("$gte", from);
+            }
+            if (notBlank(to)) {
+                range.append("$lte", to + "T23:59:59Z");
+            }
+            pathClauses.add(new Document(fieldPath, range));
+        }
+
+        clauses.add(pathClauses.size() == 1 ? pathClauses.get(0) : new Document("$or", pathClauses));
+    }
+
+    private void numericRangeIf(List<Document> clauses, Map<String, String> filters,
+                                String fromKey, String toKey, boolean integer, String... fieldPaths) {
+        String from = filters.get(fromKey);
+        String to = filters.get(toKey);
+        if (!notBlank(from) && !notBlank(to)) {
+            return;
+        }
+
+        try {
+            List<Document> exprClauses = new ArrayList<>();
+            Object fieldExpr = integer ? integerExpr(fieldPaths) : decimalExpr(fieldPaths);
+            if (notBlank(from)) {
+                exprClauses.add(new Document("$gte",
+                        Arrays.asList(fieldExpr, integer ? Integer.parseInt(from.trim()) : Double.parseDouble(from.trim()))));
+            }
+            if (notBlank(to)) {
+                exprClauses.add(new Document("$lte",
+                        Arrays.asList(fieldExpr, integer ? Integer.parseInt(to.trim()) : Double.parseDouble(to.trim()))));
+            }
+            Object expr = exprClauses.size() == 1 ? exprClauses.get(0) : new Document("$and", exprClauses);
+            clauses.add(new Document("$expr", expr));
+        } catch (NumberFormatException ignored) {
+        }
+    }
+
+    private Document buildDynamicClause(String param, String value) {
+        if ("true".equalsIgnoreCase(value) || "false".equalsIgnoreCase(value)) {
+            boolean boolValue = Boolean.parseBoolean(value);
+            return new Document("$or", Arrays.asList(
+                    new Document(param, boolValue),
+                    new Document(param, String.valueOf(boolValue)),
+                    new Document(param, value)
+            ));
+        }
+        return regexClause(param, value);
+    }
+
     private SearchResponse toResponse(Document doc) {
-        SearchResponse r = new SearchResponse();
+        SearchResponse response = new SearchResponse();
 
-        // ID
-        Object oid = doc.get("_id");
-        r.setId(oid != null ? oid.toString() : null);
+        Document header = documentAt(doc, "header");
+        Document status = documentAt(doc, "status");
+        Document protocolParams = documentAt(doc, "protocolParams");
+        Document channel = documentAt(doc, "channel");
+        Document extractedFields = documentAt(doc, "extractedFields");
+        Document bulkInfo = documentAt(doc, "bulkInfo");
+        Document body = documentAt(doc, "body");
+        Document payloadDoc = documentAt(doc, PAYLOAD_ALIAS);
+        Document mtParsedPayload = documentAt(payloadDoc, "mtParsedPayload");
+        Document block1 = documentAt(mtParsedPayload, "block1");
+        Document block2 = documentAt(mtParsedPayload, "block2");
+        String messageType = firstNonBlank(doc.getString("messageFamily"), payloadDoc.getString("messageFamily"));
+        String messageCode = firstNonBlank(doc.getString("messageTypeCode"), header.getString("messageTypeCode"), payloadDoc.getString("messageTypeCode"));
 
-        // ── Sequence / session ─────────────────────────────────────────────
-        parseIntStr(doc.getString("finSequenceNumber"), r::setSequenceNumber);
-        r.setSessionNumber(doc.getString("finSessionNumber"));
+        String rawFin = firstNonBlank(
+                stringValue(mtParsedPayloadAt(mtParsedPayload, "rawFields", "_raw")),
+                firstNonBlank(payloadDoc.getString("rawFin"), mtParsedPayload.getString("rawFin")),
+                composeRawFin(mtParsedPayload),
+                body.getString("rawPayload")
+        );
+        List<Map<String, Object>> block4Fields = buildBlock4Fields(payloadDoc, mtParsedPayload, rawFin, messageType, messageCode);
+        String rawBlock1 = firstNonBlank(mtParsedPayload.getString("rawBlock1"), extractBlock1Content(rawFin));
 
-        // ── Classification ─────────────────────────────────────────────────
-        r.setMessageType(doc.getString("messageFamily"));
-        r.setMessageCode(doc.getString("messageTypeCode"));
-        r.setMessageFormat(doc.getString("messageFormat"));
-        r.setMessageTypeDescription(doc.getString("messageTypeDescription"));
+        response.setId(stringValue(doc.get("_id")));
+        parseIntStr(firstNonBlank(
+                doc.getString("finSequenceNumber"),
+                protocolParams.getString("sequenceNumber"),
+                block1.getString("sequenceNumber"),
+                parseSequenceNumberFromBlock1(rawBlock1)
+        ), response::setSequenceNumber);
+        response.setSessionNumber(firstNonBlank(
+                doc.getString("finSessionNumber"),
+                protocolParams.getString("sessionNumber"),
+                block1.getString("sessionNumber"),
+                parseSessionNumberFromBlock1(rawBlock1)
+        ));
 
-        // ── Status / lifecycle ─────────────────────────────────────────────
-        r.setStatus(doc.getString("currentStatus"));
-        r.setPhase(doc.getString("statusPhase"));
-        r.setAction(doc.getString("statusAction"));
-        r.setReason(doc.getString("statusReason"));
-        r.setStatusMessage(doc.getString("statusMessage"));
-        r.setStatusChangeSource(doc.getString("statusChangeSource"));
-        r.setStatusDecision(doc.getString("statusDecision"));
-        r.setIo(doc.getString("direction"));
+        response.setMessageType(messageType);
+        response.setMessageCode(messageCode);
+        response.setMessageFormat(firstNonBlank(doc.getString("messageFormat"), header.getString("messageFormat"), payloadDoc.getString("messageFormat")));
+        response.setMessageTypeDescription(firstNonBlank(doc.getString("messageTypeDescription"), header.getString("messageTypeDescription")));
 
-        // ── Dates ──────────────────────────────────────────────────────────
-        r.setCreationDate(doc.getString("dateCreated"));
-        r.setReceivedDT(doc.getString("dateReceived"));
-        r.setStatusDate(doc.getString("statusDate"));
-        r.setValueDate(doc.getString("ampValueDate"));
+        response.setStatus(firstNonBlank(doc.getString("currentStatus"), status.getString("current")));
+        response.setPhase(firstNonBlank(doc.getString("statusPhase"), status.getString("phase")));
+        response.setAction(firstNonBlank(doc.getString("statusAction"), status.getString("action")));
+        response.setReason(firstNonBlank(doc.getString("statusReason"), status.getString("reason")));
+        response.setStatusMessage(firstNonBlank(doc.getString("statusMessage"), status.getString("message")));
+        response.setStatusChangeSource(firstNonBlank(doc.getString("statusChangeSource"), status.getString("changeSource")));
+        response.setStatusDecision(firstNonBlank(doc.getString("statusDecision"), status.getString("decision")));
+        response.setIo(firstNonBlank(doc.getString("direction"), header.getString("direction")));
 
-        // ── Parties ────────────────────────────────────────────────────────
-        r.setSender(doc.getString("senderAddress"));
-        r.setReceiver(doc.getString("receiverAddress"));
-        r.setSenderInstitutionName(doc.getString("senderName"));
-        r.setReceiverInstitutionName(doc.getString("receiverName"));
+        response.setCreationDate(firstNonBlank(doc.getString("dateCreated"), header.getString("dateCreated")));
+        response.setReceivedDT(firstNonBlank(doc.getString("dateReceived"), header.getString("dateReceived")));
+        response.setStatusDate(firstNonBlank(doc.getString("statusDate"), status.getString("date")));
+        response.setValueDate(firstNonBlank(doc.getString("ampValueDate"), extractedFields.getString("valueDate")));
 
-        // ── References ────────────────────────────────────────────────────
-        r.setReference(doc.getString("messageReference"));
-        r.setTransactionReference(doc.getString("transactionReference"));
+        response.setSender(firstNonBlank(doc.getString("senderAddress"), header.getString("senderAddress"), payloadDoc.getString("senderAddress")));
+        response.setReceiver(firstNonBlank(doc.getString("receiverAddress"), header.getString("receiverAddress"), payloadDoc.getString("receiverAddress")));
+        response.setSenderInstitutionName(firstNonBlank(doc.getString("senderName"), header.getString("senderName")));
+        response.setReceiverInstitutionName(firstNonBlank(doc.getString("receiverName"), header.getString("receiverName")));
 
-        // ── Financial ─────────────────────────────────────────────────────
-        // ampAmount stored as String e.g. "2448994.05"
-        String amtStr = doc.getString("ampAmount");
-        if (amtStr != null) {
-            try { r.setAmount(Double.parseDouble(amtStr.replace(",", "."))); }
-            catch (NumberFormatException ignored) {}
+        response.setReference(firstNonBlank(doc.getString("messageReference"), header.getString("messageReference")));
+        response.setTransactionReference(firstNonBlank(doc.getString("transactionReference"), header.getString("transactionReference")));
+
+        response.setAmount(parseFlexibleDouble(firstNonBlank(doc.getString("ampAmount"), extractedFields.getString("amount"), payloadDoc.getString("amount"))));
+        response.setCcy(firstNonBlank(doc.getString("ampCurrency"), extractedFields.getString("currency"), payloadDoc.getString("currency")));
+        response.setDetailsOfCharges(firstNonBlank(doc.getString("ampDetailsOfCharges"), extractedFields.getString("detailsOfCharges"), payloadDoc.getString("detailsOfCharges"), mtParsedPayload.getString("detailsOfCharges")));
+        response.setRemittanceInfo(firstNonBlank(doc.getString("ampRemittanceInformation"), extractedFields.getString("remittanceInformation"), payloadDoc.getString("remittanceInfo"), mtParsedPayload.getString("remittanceInfo")));
+
+        response.setNetworkProtocol(firstNonBlank(doc.getString("protocol"), header.getString("protocol"), payloadDoc.getString("protocol")));
+        response.setNetworkChannel(firstNonBlank(doc.getString("networkChannel"), header.getString("networkChannel"), header.getString("backendChannel")));
+        response.setNetworkPriority(firstNonBlank(doc.getString("networkPriority"), header.getString("networkPriority")));
+        response.setDeliveryMode(firstNonBlank(doc.getString("communicationType"), channel.getString("communicationType")));
+        response.setCommunicationType(response.getDeliveryMode());
+        response.setService(firstNonBlank(doc.getString("service"), header.getString("service")));
+        response.setBackendChannel(firstNonBlank(doc.getString("backendChannel"), header.getString("backendChannel"), channel.getString("backendChannelName")));
+        response.setBackendChannelCode(firstNonBlank(doc.getString("backendChannelCode"), channel.getString("backendChannelCode")));
+        response.setBackendChannelDescription(firstNonBlank(doc.getString("backendChannelDescription"), channel.getString("backendChannelDescription")));
+        response.setChannelCode(firstNonBlank(doc.getString("channelCode"), channel.getString("code")));
+        response.setBackendChannelProtocol(firstNonBlank(doc.getString("channelProtocol"), channel.getString("protocol")));
+
+        response.setOwner(firstNonBlank(doc.getString("owner"), header.getString("owner")));
+        response.setWorkflow(firstNonBlank(doc.getString("workflow"), header.getString("workflow")));
+        response.setWorkflowModel(firstNonBlank(doc.getString("workflowModel"), header.getString("workflowModel")));
+        response.setProcessingType(firstNonBlank(doc.getString("processingType"), header.getString("processingType")));
+        response.setProcessPriority(firstNonBlank(doc.getString("processPriority"), header.getString("processPriority")));
+        response.setProfileCode(firstNonBlank(doc.getString("profileCode"), header.getString("profileCode")));
+        response.setOriginatorApplication(firstNonBlank(doc.getString("originatorApplication"), header.getString("originatorApplication")));
+
+        response.setApplicationId(firstNonBlank(doc.getString("finAppId"), protocolParams.getString("appId"), block1.getString("applicationId")));
+        response.setServiceId(firstNonBlank(doc.getString("finServiceId"), protocolParams.getString("serviceId"), block1.getString("serviceId")));
+        response.setLogicalTerminalAddress(firstNonBlank(doc.getString("finLogicalTerminal"), protocolParams.getString("logicalTerminal"), block1.getString("logicalTerminalAddress")));
+        response.setMessagePriority(firstNonBlank(doc.getString("finMessagePriority"), protocolParams.getString("messagePriority"), block2.getString("messagePriority")));
+        response.setFinDirectionId(firstNonBlank(doc.getString("finDirectionId"), protocolParams.getString("directionId"), block2.getString("directionId")));
+        response.setFinMessageType(firstNonBlank(doc.getString("finMessageType"), protocolParams.getString("messageType"), block2.getString("messageType")));
+        response.setFinReceiversAddress(firstNonBlank(doc.getString("finReceiversAddress"), protocolParams.getString("receiversAddress"), block2.getString("receiverAddress")));
+
+        response.setDigestMCheckResult(firstNonBlank(doc.getString("digestMCheckResult"), stringValue(protocolParams.get("digestMCheckResult"))));
+        response.setDigest2CheckResult(firstNonBlank(doc.getString("digest2CheckResult"), stringValue(protocolParams.get("digest2CheckResult"))));
+
+        response.setBulkType(firstNonBlank(doc.getString("bulkType"), bulkInfo.getString("bulkType")));
+        parseIntObj(firstNonBlankObject(doc.get("bulkSequenceNumber"), bulkInfo.get("sequenceNumber")), response::setBulkSequenceNumber);
+        parseIntObj(firstNonBlankObject(doc.get("bulkTotalMessages"), bulkInfo.get("totalMessages")), response::setBulkTotalMessages);
+
+        response.setPdeIndication(firstNonBlank(doc.getString("pdeIndication"), stringValue(header.get("pdeIndication"))));
+        response.setPossibleDuplicate("true".equalsIgnoreCase(response.getPdeIndication()));
+
+        response.setMur(firstNonBlank(
+                documentAt(doc, "mtPayload").getString("transactionReference"),
+                mtParsedPayload.getString("transactionReference"),
+                payloadDoc.getString("messageReference")
+        ));
+        response.setBankOperationCode(firstNonBlank(documentAt(doc, "mtPayload").getString("bankOperationCode"), payloadDoc.getString("bankOperationCode"), mtParsedPayload.getString("bankOperationCode")));
+        response.setPayloadCurrency(firstNonBlank(documentAt(doc, "mtPayload").getString("currency"), payloadDoc.getString("currency"), mtParsedPayload.getString("currency")));
+        response.setPayloadValueDate(firstNonBlank(documentAt(doc, "mtPayload").getString("valueDate"), payloadDoc.getString("valueDate"), mtParsedPayload.getString("valueDate")));
+        response.setInterbankSettledAmount(firstNonBlank(documentAt(doc, "mtPayload").getString("interbankSettledAmount"), mtParsedPayload.getString("interbankSettledAmount")));
+        response.setInstructedCurrency(firstNonBlank(documentAt(doc, "mtPayload").getString("instructedCurrency"), payloadDoc.getString("instructedCurrency"), mtParsedPayload.getString("instructedCurrency")));
+        response.setInstructedAmount(firstNonBlank(documentAt(doc, "mtPayload").getString("instructedAmount"), payloadDoc.getString("instructedAmount"), mtParsedPayload.getString("instructedAmount")));
+
+        response.setOrderingCustomer(firstNonBlank(documentAt(doc, "mtPayload").getString("orderingCustomer"), payloadDoc.getString("orderingCustomer"), mtParsedPayload.getString("orderingCustomer")));
+        response.setOrderingInstitution(firstNonBlank(documentAt(doc, "mtPayload").getString("orderingInstitution"), payloadDoc.getString("orderingInstitution"), mtParsedPayload.getString("orderingInstitution")));
+        response.setSenderCorrespondent(firstNonBlank(documentAt(doc, "mtPayload").getString("senderCorrespondent"), payloadDoc.getString("senderCorrespondent"), mtParsedPayload.getString("senderCorrespondent")));
+        response.setAccountWithInstitution(firstNonBlank(documentAt(doc, "mtPayload").getString("accountWithInstitution"), payloadDoc.getString("accountWithInstitution"), mtParsedPayload.getString("accountWithInstitution")));
+        response.setBeneficiaryCustomer(firstNonBlank(documentAt(doc, "mtPayload").getString("beneficiaryCustomer"), payloadDoc.getString("beneficiaryCustomer"), mtParsedPayload.getString("beneficiaryCustomer")));
+
+        response.setCorrespondent(firstNonBlank(response.getSenderCorrespondent(), doc.getString("correspondent")));
+
+        response.setPayloadFieldCount(computePayloadFieldCount(mtParsedPayload, block4Fields));
+        response.setPayloadSize(firstNonBlank(documentAt(doc, "mtPayload").getString("payloadSize"), payloadDoc.getString("payloadSize")));
+        response.setRawFin(rawFin);
+        response.setBlock4Fields(block4Fields);
+        response.setHistoryLines(toMapList(doc.get("historyLines")));
+
+        Document rawMessage = new Document(doc);
+        rawMessage.remove(PAYLOAD_ALIAS);
+        if (!payloadDoc.isEmpty()) {
+            rawMessage.put("mtPayload", buildCompatibilityPayload(payloadDoc, mtParsedPayload, block4Fields, rawFin));
         }
-        r.setCcy(doc.getString("ampCurrency"));
-        r.setDetailsOfCharges(doc.getString("ampDetailsOfCharges"));
-        r.setRemittanceInfo(doc.getString("ampRemittanceInformation"));
+        response.setRawMessage(new LinkedHashMap<>(rawMessage));
 
-        // ── Network / routing ──────────────────────────────────────────────
-        r.setNetworkProtocol(doc.getString("protocol"));
-        r.setNetworkChannel(doc.getString("networkChannel"));
-        r.setNetworkPriority(doc.getString("networkPriority"));
-        r.setDeliveryMode(doc.getString("communicationType"));
-        r.setCommunicationType(doc.getString("communicationType"));
-        r.setService(doc.getString("service"));
-        r.setBackendChannel(doc.getString("backendChannel"));
-        r.setBackendChannelCode(doc.getString("backendChannelCode"));
-        r.setBackendChannelDescription(doc.getString("backendChannelDescription"));
-        r.setChannelCode(doc.getString("channelCode"));
-        r.setBackendChannelProtocol(doc.getString("channelProtocol"));
+        response.setFormat(response.getMessageType());
+        response.setType(response.getMessageCode());
+        response.setDate(dateOnly(response.getCreationDate()));
+        response.setTime(timeOnly(response.getCreationDate()));
+        response.setDirection(response.getIo());
+        response.setNetwork(response.getNetworkProtocol());
+        response.setOwnerUnit(response.getOwner());
+        response.setCurrency(response.getCcy());
+        response.setFinCopy(response.getFinCopyService());
+        response.setSourceSystem(response.getOriginatorApplication());
 
-        // ── Processing / ownership ─────────────────────────────────────────
-        r.setOwner(doc.getString("owner"));
-        r.setWorkflow(doc.getString("workflow"));
-        r.setWorkflowModel(doc.getString("workflowModel"));
-        r.setProcessingType(doc.getString("processingType"));
-        r.setProcessPriority(doc.getString("processPriority"));
-        r.setProfileCode(doc.getString("profileCode"));
-        r.setOriginatorApplication(doc.getString("originatorApplication"));
-
-        // ── FIN header — top-level flat fields ─────────────────────────────
-        r.setApplicationId(doc.getString("finAppId"));
-        r.setServiceId(doc.getString("finServiceId"));
-        r.setLogicalTerminalAddress(doc.getString("finLogicalTerminal"));
-        r.setMessagePriority(doc.getString("finMessagePriority"));
-        r.setFinDirectionId(doc.getString("finDirectionId"));
-        r.setFinMessageType(doc.getString("finMessageType"));
-        r.setFinReceiversAddress(doc.getString("finReceiversAddress"));
-
-        // ── Digest / integrity ─────────────────────────────────────────────
-        r.setDigestMCheckResult(doc.getString("digestMCheckResult"));
-        r.setDigest2CheckResult(doc.getString("digest2CheckResult"));
-
-        // ── Bulk info ──────────────────────────────────────────────────────
-        r.setBulkType(doc.getString("bulkType"));
-        Object bsn = doc.get("bulkSequenceNumber");
-        if (bsn instanceof Number n) r.setBulkSequenceNumber(n.intValue());
-        Object btm = doc.get("bulkTotalMessages");
-        if (btm instanceof Number n) r.setBulkTotalMessages(n.intValue());
-
-        // ── PDE / duplicate flag ───────────────────────────────────────────
-        String pde = doc.getString("pdeIndication");
-        r.setPdeIndication(pde);
-        r.setPossibleDuplicate("true".equalsIgnoreCase(pde));
-
-        // ── historyLines (top-level array) ─────────────────────────────────
-        Object hlRaw = doc.get("historyLines");
-        if (hlRaw instanceof List<?> hlList) {
-            r.setHistoryLines(hlList.stream()
-                    .filter(e -> e instanceof Document)
-                    .map(e -> new LinkedHashMap<String, Object>((Document) e))
-                    .collect(Collectors.toList()));
-        }
-
-        // ── mtPayload nested document ──────────────────────────────────────
-        Document mtPayload = doc.get("mtPayload") instanceof Document mp ? mp : new Document();
-        Document block1    = mtPayload.get("block1") instanceof Document b1 ? b1 : new Document();
-        Document block2    = mtPayload.get("block2") instanceof Document b2 ? b2 : new Document();
-
-        // MUR = tag-20 value (Transaction Reference from block4)
-        r.setMur(mtPayload.getString("transactionReference"));
-
-        // Financial extracted fields from mtPayload
-        r.setBankOperationCode(mtPayload.getString("bankOperationCode"));
-        r.setPayloadCurrency(mtPayload.getString("currency"));
-        r.setPayloadValueDate(mtPayload.getString("valueDate"));
-        r.setInterbankSettledAmount(mtPayload.getString("interbankSettledAmount"));
-        r.setInstructedCurrency(mtPayload.getString("instructedCurrency"));
-        r.setInstructedAmount(mtPayload.getString("instructedAmount"));
-
-        // SWIFT party fields
-        r.setOrderingCustomer(mtPayload.getString("orderingCustomer"));
-        r.setOrderingInstitution(mtPayload.getString("orderingInstitution"));
-        r.setSenderCorrespondent(mtPayload.getString("senderCorrespondent"));
-        r.setAccountWithInstitution(mtPayload.getString("accountWithInstitution"));
-        r.setBeneficiaryCustomer(mtPayload.getString("beneficiaryCustomer"));
-
-        // Fallback detailsOfCharges / remittanceInfo from mtPayload if not on top-level
-        if (r.getDetailsOfCharges() == null) r.setDetailsOfCharges(mtPayload.getString("detailsOfCharges"));
-        if (r.getRemittanceInfo()   == null) r.setRemittanceInfo(mtPayload.getString("remittanceInfo"));
-
-        // Payload metadata
-        Object fc = mtPayload.get("fieldCount");
-        if (fc instanceof Number n) r.setPayloadFieldCount(n.intValue());
-        r.setPayloadSize(mtPayload.getString("payloadSize"));
-
-        // FIN header fallback — top-level takes priority, block1/block2 as fallback
-        if (r.getApplicationId()           == null) r.setApplicationId(block1.getString("applicationId"));
-        if (r.getServiceId()               == null) r.setServiceId(block1.getString("serviceId"));
-        if (r.getLogicalTerminalAddress()  == null) r.setLogicalTerminalAddress(block1.getString("logicalTerminalAddress"));
-        if (r.getMessagePriority()         == null) r.setMessagePriority(block2.getString("messagePriority"));
-        if (r.getFinDirectionId()          == null) r.setFinDirectionId(block2.getString("directionId"));
-        if (r.getFinMessageType()          == null) r.setFinMessageType(block2.getString("messageType"));
-        if (r.getFinReceiversAddress()     == null) r.setFinReceiversAddress(block2.getString("receiverAddress"));
-
-        // Raw FIN string
-        r.setRawFin(mtPayload.getString("rawFin"));
-
-        // block4Fields
-        Object b4Raw = mtPayload.get("block4Fields");
-        if (b4Raw instanceof List<?> b4List) {
-            r.setBlock4Fields(b4List.stream()
-                    .filter(e -> e instanceof Document)
-                    .map(e -> new LinkedHashMap<String, Object>((Document) e))
-                    .collect(Collectors.toList()));
-        }
-
-        // ── Full raw document for detail modal ────────────────────────────
-        r.setRawMessage(new LinkedHashMap<>(doc));
-
-        // ── UI aliases ────────────────────────────────────────────────────
-        r.setFormat(r.getMessageType());
-        r.setType(r.getMessageCode());
-        r.setDate(dateOnly(r.getCreationDate()));
-        r.setTime(timeOnly(r.getCreationDate()));
-        r.setDirection(r.getIo());
-        r.setNetwork(r.getNetworkProtocol());
-        r.setOwnerUnit(r.getOwner());
-        r.setCurrency(r.getCcy());
-        r.setFinCopy(r.getFinCopyService());
-        r.setSourceSystem(null);
-
-        return r;
+        return response;
     }
 
-    // ── Utilities ─────────────────────────────────────────────────────────
-    private void parseIntStr(String s, java.util.function.Consumer<Integer> setter) {
-        if (s == null) return;
-        try { setter.accept(Integer.parseInt(s.trim())); } catch (NumberFormatException ignored) {}
+    private SearchResponse toSearchRowResponse(Document doc) {
+        SearchResponse response = toResponse(doc);
+        response.setRawFin(null);
+        response.setBlock4Fields(Collections.emptyList());
+        response.setHistoryLines(Collections.emptyList());
+        response.setRawMessage(null);
+        return response;
     }
-    private String dateOnly(String iso) {
-        if (iso == null || iso.length() < 10) return null;
-        return iso.substring(0, 10).replace("-", "/");
+
+    private Document buildCompatibilityPayload(Document payloadDoc, Document mtParsedPayload,
+                                               List<Map<String, Object>> block4Fields, String rawFin) {
+        Document compatibility = new Document();
+        if (!mtParsedPayload.isEmpty()) {
+            compatibility.putAll(mtParsedPayload);
+        }
+        compatibility.put("block1", new Document(documentAt(mtParsedPayload, "block1")));
+        compatibility.put("block2", new Document(documentAt(mtParsedPayload, "block2")));
+        compatibility.put("block4Fields", block4Fields);
+        compatibility.put("rawFin", rawFin);
+        compatibility.put("fieldCount", computePayloadFieldCount(mtParsedPayload, block4Fields));
+        compatibility.put("payloadSize", payloadDoc.getString("payloadSize"));
+        compatibility.put("payloadEncoding", payloadDoc.getString("payloadEncoding"));
+        compatibility.put("digest", payloadDoc.getString("digest"));
+        compatibility.put("digestAlgorithm", payloadDoc.getString("digestAlgorithm"));
+        return compatibility;
     }
-    private String timeOnly(String iso) {
-        if (iso == null || iso.length() < 19) return null;
-        return iso.substring(11, 19);
+
+    private List<Map<String, Object>> buildBlock4Fields(Document payloadDoc, Document mtParsedPayload, String rawFin,
+                                                        String messageType, String messageCode) {
+        List<Map<String, Object>> existingRows = existingBlock4Fields(payloadDoc, mtParsedPayload);
+        if (!existingRows.isEmpty()) {
+            return enrichMtBlock4Labels(messageType, messageCode, existingRows);
+        }
+
+        Document rawFields = documentAt(mtParsedPayload, "rawFields");
+        if (!rawFields.isEmpty()) {
+            List<Map<String, Object>> rows = new ArrayList<>();
+            for (Map.Entry<String, Object> entry : rawFields.entrySet()) {
+                String tag = entry.getKey();
+                if ("_raw".equals(tag)) {
+                    continue;
+                }
+                List<String> values = toStringList(entry.getValue());
+                if (values.isEmpty()) {
+                    rows.add(block4Row(tag, null, null));
+                    continue;
+                }
+                for (String value : values) {
+                    rows.add(block4Row(tag, null, value));
+                }
+            }
+            return enrichMtBlock4Labels(messageType, messageCode, rows);
+        }
+
+        return enrichMtBlock4Labels(messageType, messageCode, buildBlock4FieldsFromRawFin(rawFin));
+    }
+
+    private List<Map<String, Object>> buildBlock4FieldsFromRawFin(String rawFin) {
+        String block4 = extractBlock4Content(rawFin);
+        if (!notBlank(block4)) {
+            return Collections.emptyList();
+        }
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        String currentTag = null;
+        StringBuilder currentValue = new StringBuilder();
+        String normalized = block4.replace("\r\n", "\n").replace('\r', '\n');
+
+        for (String line : normalized.split("\n")) {
+            if (!notBlank(line)) {
+                if (currentTag != null) {
+                    currentValue.append('\n');
+                }
+                continue;
+            }
+
+            if ("-}".equals(line.trim())) {
+                continue;
+            }
+
+            if (line.startsWith(":")) {
+                int secondColon = line.indexOf(':', 1);
+                if (secondColon > 1) {
+                    if (currentTag != null) {
+                        rows.add(block4Row(currentTag, null, cleanBlock4Value(currentValue.toString())));
+                    }
+                    currentTag = line.substring(1, secondColon).trim();
+                    currentValue.setLength(0);
+                    currentValue.append(line.substring(secondColon + 1));
+                    continue;
+                }
+            }
+
+            if (currentTag != null) {
+                if (currentValue.length() > 0) {
+                    currentValue.append('\n');
+                }
+                currentValue.append(line);
+            }
+        }
+
+        if (currentTag != null) {
+            rows.add(block4Row(currentTag, null, cleanBlock4Value(currentValue.toString())));
+        }
+
+        return rows;
+    }
+
+    private Map<String, Object> block4Row(String tag, String label, String value) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("tag", tag);
+        row.put("label", label);
+        row.put("rawValue", value == null || value.isBlank() ? "—" : value);
+        row.put("components", Collections.emptyMap());
+        return row;
+    }
+
+    private List<Map<String, Object>> existingBlock4Fields(Document payloadDoc, Document mtParsedPayload) {
+        List<Map<String, Object>> payloadLevel = toMapList(payloadDoc.get("block4Fields"));
+        if (!payloadLevel.isEmpty()) {
+            return payloadLevel.stream().map(this::normalizeBlock4FieldRow).collect(Collectors.toList());
+        }
+
+        List<Map<String, Object>> parsedLevel = toMapList(mtParsedPayload.get("block4Fields"));
+        if (!parsedLevel.isEmpty()) {
+            return parsedLevel.stream().map(this::normalizeBlock4FieldRow).collect(Collectors.toList());
+        }
+        return Collections.emptyList();
+    }
+
+    private Map<String, Object> normalizeBlock4FieldRow(Map<String, Object> source) {
+        Map<String, Object> row = new LinkedHashMap<>(source);
+        row.put("tag", stringValue(source.get("tag")));
+        row.put("label", stringValue(source.get("label")));
+        row.put("rawValue", firstNonBlank(stringValue(source.get("rawValue")), "â€”"));
+        Object components = source.get("components");
+        row.put("components", components instanceof Map<?, ?> ? components : Collections.emptyMap());
+        return row;
+    }
+
+    private List<Map<String, Object>> enrichMtBlock4Labels(String messageType, String messageCode, List<Map<String, Object>> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<Map<String, Object>> normalizedRows = rows.stream()
+                .map(this::normalizeBlock4FieldRow)
+                .collect(Collectors.toList());
+
+        if (!isMtMessage(messageType, messageCode)) {
+            normalizedRows.forEach(this::applyBuiltInLabelIfMissing);
+            return normalizedRows;
+        }
+
+        List<String> missingTags = normalizedRows.stream()
+                .filter(row -> shouldLookupMtLabel(stringValue(row.get("label"))))
+                .map(row -> stringValue(row.get("tag")))
+                .filter(this::notBlank)
+                .distinct()
+                .collect(Collectors.toList());
+
+        Map<String, String> mongoLabelsByTag = lookupMtLabels(messageCode, missingTags);
+
+        for (Map<String, Object> row : normalizedRows) {
+            String existingLabel = stringValue(row.get("label"));
+            if (!shouldLookupMtLabel(existingLabel)) {
+                continue;
+            }
+
+            String tag = stringValue(row.get("tag"));
+            String resolvedLabel = mongoLabelsByTag.get(tag);
+            if (!notBlank(resolvedLabel)) {
+                resolvedLabel = FIN_TAG_LABELS.get(tag);
+            }
+            if (notBlank(resolvedLabel)) {
+                row.put("label", resolvedLabel);
+            }
+        }
+
+        return normalizedRows;
+    }
+
+    private Map<String, String> lookupMtLabels(String messageCode, List<String> tags) {
+        if (!notBlank(messageCode) || tags == null || tags.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        List<String> messageTypeCandidates = buildMtLabelMessageTypeCandidates(messageCode);
+        List<Document> docs = mongoTemplate.getCollection(appConfig.getMtLabelsCollection())
+                .find(new Document("messageType", new Document("$in", messageTypeCandidates))
+                        .append("tag", new Document("$in", tags)))
+                .into(new ArrayList<>());
+
+        Map<String, Integer> messageTypePriority = new HashMap<>();
+        for (int i = 0; i < messageTypeCandidates.size(); i++) {
+            messageTypePriority.put(messageTypeCandidates.get(i), i);
+        }
+
+        Map<String, List<Document>> byTag = docs.stream()
+                .filter(doc -> notBlank(doc.getString("tag")) && notBlank(doc.getString("label")))
+                .collect(Collectors.groupingBy(doc -> doc.getString("tag")));
+
+        Map<String, String> resolved = new HashMap<>();
+        for (String tag : tags) {
+            List<Document> candidates = byTag.getOrDefault(tag, Collections.emptyList());
+            candidates.stream()
+                    .sorted(Comparator
+                            .comparingInt((Document doc) -> messageTypePriority.getOrDefault(doc.getString("messageType"), Integer.MAX_VALUE))
+                            .thenComparingInt(doc -> notBlank(doc.getString("qualifier")) ? 1 : 0))
+                    .map(doc -> doc.getString("label"))
+                    .filter(this::notBlank)
+                    .findFirst()
+                    .ifPresent(label -> resolved.put(tag, label));
+        }
+        return resolved;
+    }
+
+    private List<String> buildMtLabelMessageTypeCandidates(String messageCode) {
+        if (!notBlank(messageCode)) {
+            return Collections.emptyList();
+        }
+        String trimmed = messageCode.trim().toUpperCase();
+        String digits = trimmed.startsWith("MT") ? trimmed.substring(2) : trimmed;
+        LinkedHashSet<String> candidates = new LinkedHashSet<>();
+        candidates.add(trimmed);
+        if (!digits.isBlank()) {
+            candidates.add("MT " + digits);
+            candidates.add(digits);
+        }
+        return new ArrayList<>(candidates);
+    }
+
+    private boolean isMtMessage(String messageType, String messageCode) {
+        return (notBlank(messageType) && "MT".equalsIgnoreCase(messageType.trim()))
+                || (notBlank(messageCode) && messageCode.trim().toUpperCase().startsWith("MT"));
+    }
+
+    private boolean shouldLookupMtLabel(String label) {
+        return !notBlank(label) || "â€”".equals(label) || label.toUpperCase().startsWith("TAG ");
+    }
+
+    private void applyBuiltInLabelIfMissing(Map<String, Object> row) {
+        String label = stringValue(row.get("label"));
+        if (!shouldLookupMtLabel(label)) {
+            return;
+        }
+        String tag = stringValue(row.get("tag"));
+        if (notBlank(tag) && FIN_TAG_LABELS.containsKey(tag)) {
+            row.put("label", FIN_TAG_LABELS.get(tag));
+        }
+    }
+
+    private String extractBlock4Content(String rawFin) {
+        if (!notBlank(rawFin)) {
+            return null;
+        }
+
+        int blockStart = rawFin.indexOf("{4:");
+        if (blockStart >= 0) {
+            int contentStart = blockStart + 3;
+            int blockEnd = rawFin.indexOf("-}", contentStart);
+            String content = blockEnd >= 0
+                    ? rawFin.substring(contentStart, blockEnd)
+                    : rawFin.substring(contentStart);
+            return content.strip();
+        }
+
+        return rawFin.strip();
+    }
+
+    private String extractBlock1Content(String rawFin) {
+        if (!notBlank(rawFin)) {
+            return null;
+        }
+
+        int blockStart = rawFin.indexOf("{1:");
+        if (blockStart < 0) {
+            return null;
+        }
+
+        int contentStart = blockStart + 3;
+        int blockEnd = rawFin.indexOf('}', contentStart);
+        if (blockEnd < 0) {
+            return rawFin.substring(contentStart).strip();
+        }
+        return rawFin.substring(contentStart, blockEnd).strip();
+    }
+
+    private String parseSessionNumberFromBlock1(String rawBlock1) {
+        if (!notBlank(rawBlock1)) {
+            return null;
+        }
+        String compact = rawBlock1.trim();
+        if (compact.length() < 10) {
+            return null;
+        }
+        return compact.substring(compact.length() - 10, compact.length() - 6);
+    }
+
+    private String parseSequenceNumberFromBlock1(String rawBlock1) {
+        if (!notBlank(rawBlock1)) {
+            return null;
+        }
+        String compact = rawBlock1.trim();
+        if (compact.length() < 6) {
+            return null;
+        }
+        return compact.substring(compact.length() - 6);
+    }
+
+    private String cleanBlock4Value(String value) {
+        if (!notBlank(value)) {
+            return null;
+        }
+        String cleaned = value.replaceAll("\\s*-}$", "").strip();
+        return cleaned.isEmpty() ? null : cleaned;
+    }
+
+    private Integer computePayloadFieldCount(Document mtParsedPayload, List<Map<String, Object>> block4Fields) {
+        Document rawFields = documentAt(mtParsedPayload, "rawFields");
+        if (!rawFields.isEmpty()) {
+            int count = (int) rawFields.keySet().stream().filter(key -> !"_raw".equals(key)).count();
+            return count == 0 ? null : count;
+        }
+        return block4Fields == null || block4Fields.isEmpty() ? null : block4Fields.size();
+    }
+
+    private String composeRawFin(Document mtParsedPayload) {
+        String rawBlock1 = mtParsedPayload.getString("rawBlock1");
+        String rawBlock2 = mtParsedPayload.getString("rawBlock2");
+        String rawBlock4 = mtParsedPayload.getString("rawBlock4");
+        if (!notBlank(rawBlock1) && !notBlank(rawBlock2) && !notBlank(rawBlock4)) {
+            return null;
+        }
+        StringBuilder builder = new StringBuilder();
+        if (notBlank(rawBlock1)) {
+            builder.append("{1:").append(rawBlock1).append("}");
+        }
+        if (notBlank(rawBlock2)) {
+            builder.append("{2:").append(rawBlock2).append("}");
+        }
+        if (notBlank(rawBlock4)) {
+            builder.append("{4:\n").append(rawBlock4);
+            if (!rawBlock4.endsWith("-}")) {
+                builder.append("-}");
+            }
+        }
+        return builder.toString();
+    }
+
+    private List<Map<String, Object>> toMapList(Object value) {
+        if (!(value instanceof List<?> list)) {
+            return Collections.emptyList();
+        }
+
+        return list.stream()
+                .map(item -> {
+                    if (item instanceof Document document) {
+                        return new LinkedHashMap<String, Object>(document);
+                    }
+                    if (item instanceof Map<?, ?> map) {
+                        Map<String, Object> converted = new LinkedHashMap<>();
+                        map.forEach((key, itemValue) -> converted.put(String.valueOf(key), itemValue));
+                        return converted;
+                    }
+                    return null;
+                })
+                .filter(item -> item != null && !item.isEmpty())
+                .collect(Collectors.toList());
+    }
+
+    private List<Document> aggregate(String collection, List<Document> pipeline) {
+        return mongoTemplate.getCollection(collection).aggregate(pipeline).into(new ArrayList<>());
+    }
+
+    private long aggregateCount(String collection, List<Document> pipeline, Map<String, String> filters) {
+        if (filters == null || filters.isEmpty()) {
+            CachedValue<Long> cache = unfilteredCountCache;
+            if (cache != null && !cache.isExpired(appConfig.getMetadataCacheTtlMs())) {
+                return cache.value();
+            }
+        }
+        List<Document> countPipeline = new ArrayList<>(pipeline);
+        countPipeline.add(new Document("$count", "total"));
+        List<Document> countRows = aggregate(collection, countPipeline);
+        long total;
+        if (countRows.isEmpty()) {
+            total = 0L;
+        } else {
+            Object totalObj = countRows.get(0).get("total");
+            total = totalObj instanceof Number number ? number.longValue() : 0L;
+        }
+        if (filters == null || filters.isEmpty()) {
+            unfilteredCountCache = new CachedValue<>(total, System.currentTimeMillis());
+        }
+        return total;
+    }
+
+    private long countMessages(String collection, Document match, Map<String, String> filters) {
+        if ((filters == null || filters.isEmpty()) && (match == null || match.isEmpty())) {
+            CachedValue<Long> cache = unfilteredCountCache;
+            if (cache != null && !cache.isExpired(appConfig.getMetadataCacheTtlMs())) {
+                return cache.value();
+            }
+        }
+
+        long total = (match == null || match.isEmpty())
+                ? mongoTemplate.getCollection(collection).countDocuments()
+                : mongoTemplate.getCollection(collection).countDocuments(match);
+
+        if (filters == null || filters.isEmpty()) {
+            unfilteredCountCache = new CachedValue<>(total, System.currentTimeMillis());
+        }
+        return total;
+    }
+
+    private List<Document> findMessagePage(String collection, Document match, int page, int pageSize) {
+        var finder = mongoTemplate.getCollection(collection).find(match == null ? new Document() : match)
+                .sort(new Document("header.dateCreated", -1).append("dateCreated", -1))
+                .skip(page * pageSize)
+                .limit(pageSize);
+        return finder.into(new ArrayList<>());
+    }
+
+    private Map<String, Document> fetchPayloadsByReference(List<Document> docs) {
+        List<String> references = docs.stream()
+                .map(doc -> stringValue(doc.get("messageReference")))
+                .filter(this::notBlank)
+                .distinct()
+                .collect(Collectors.toList());
+        if (references.isEmpty()) {
+            return Collections.emptyMap();
+        }
+
+        Map<String, Document> payloadByReference = new LinkedHashMap<>();
+        int batchSize = Math.max(1, appConfig.getPayloadFetchBatchSize());
+        String payloadCollection = appConfig.getPayloadsCollection();
+
+        for (int start = 0; start < references.size(); start += batchSize) {
+            List<String> batch = references.subList(start, Math.min(start + batchSize, references.size()));
+            List<Document> payloads = mongoTemplate.getCollection(payloadCollection)
+                    .find(new Document("messageReference", new Document("$in", batch)))
+                    .into(new ArrayList<>());
+            for (Document payload : payloads) {
+                String reference = stringValue(payload.get("messageReference"));
+                if (notBlank(reference) && !payloadByReference.containsKey(reference)) {
+                    payloadByReference.put(reference, payload);
+                }
+            }
+        }
+
+        return payloadByReference;
+    }
+
+    private void appendExportBatch(List<SearchResponse> target, List<Document> docs) {
+        Map<String, Document> payloadByReference = fetchPayloadsByReference(docs);
+        docs.stream()
+                .map(doc -> toResponse(withPayloadDoc(doc, payloadByReference.get(stringValue(doc.get("messageReference"))))))
+                .forEach(target::add);
+    }
+
+    private Document withPayloadDoc(Document doc, Document payloadDoc) {
+        Document enriched = new Document(doc);
+        if (payloadDoc != null && !payloadDoc.isEmpty()) {
+            enriched.put(PAYLOAD_ALIAS, payloadDoc);
+        }
+        return enriched;
+    }
+
+    private List<String> distinct(String collection, String fieldPath) {
+        try {
+            return mongoTemplate.findDistinct(new Query(), fieldPath, collection, String.class).stream()
+                    .filter(value -> value != null && !value.isBlank())
+                    .sorted()
+                    .collect(Collectors.toList());
+        } catch (Exception ignored) {
+            return Collections.emptyList();
+        }
+    }
+
+    private List<String> distinctMerged(String collection, String... fieldPaths) {
+        Set<String> merged = new LinkedHashSet<>();
+        for (String fieldPath : fieldPaths) {
+            merged.addAll(distinct(collection, fieldPath));
+        }
+        return merged.stream().sorted().collect(Collectors.toList());
+    }
+
+    private Document regexClause(String fieldPath, String value) {
+        return new Document(fieldPath, new Document("$regex", escapeRegex(value)).append("$options", "i"));
+    }
+
+    private Document regexCondition(String fieldPath, String value) {
+        return new Document(fieldPath, new Document("$regex", escapeRegex(value)).append("$options", "i"));
+    }
+
+    private Object decimalExpr(String... fieldPaths) {
+        return new Document("$toDouble",
+                new Document("$replaceAll",
+                        new Document("input", coalesceFieldExpression("0", fieldPaths))
+                                .append("find", ",")
+                                .append("replacement", ".")
+                )
+        );
+    }
+
+    private Object integerExpr(String... fieldPaths) {
+        return new Document("$toInt", coalesceFieldExpression("0", fieldPaths));
+    }
+
+    private Object coalesceFieldExpression(String defaultValue, String... fieldPaths) {
+        Object expression = defaultValue;
+        for (int i = fieldPaths.length - 1; i >= 0; i--) {
+            expression = new Document("$ifNull", Arrays.asList("$" + fieldPaths[i], expression));
+        }
+        return expression;
+    }
+
+    private Document documentAt(Document source, String key) {
+        Object value = source.get(key);
+        return value instanceof Document document ? document : new Document();
+    }
+
+    private Object mtParsedPayloadAt(Document mtParsedPayload, String objectKey, String innerKey) {
+        Document nested = documentAt(mtParsedPayload, objectKey);
+        Object value = nested.get(innerKey);
+        if (value instanceof List<?> list && !list.isEmpty()) {
+            return list.get(0);
+        }
+        return value;
+    }
+
+    private List<String> toStringList(Object value) {
+        if (value instanceof List<?> list) {
+            return list.stream().map(this::stringValue).filter(item -> item != null && !item.isBlank()).collect(Collectors.toList());
+        }
+        String scalar = stringValue(value);
+        return scalar == null || scalar.isBlank() ? Collections.emptyList() : Collections.singletonList(scalar);
+    }
+
+    private Double parseFlexibleDouble(String value) {
+        if (!notBlank(value)) {
+            return null;
+        }
+        String normalized = value.replace(" ", "");
+        if (normalized.contains(",") && !normalized.contains(".")) {
+            normalized = normalized.replace(",", ".");
+        } else if (normalized.contains(",") && normalized.contains(".")) {
+            normalized = normalized.replace(",", "");
+        }
+        try {
+            return Double.parseDouble(normalized);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private void parseIntStr(String value, Consumer<Integer> setter) {
+        if (!notBlank(value)) {
+            return;
+        }
+        try {
+            setter.accept(Integer.parseInt(value.trim()));
+        } catch (NumberFormatException ignored) {
+        }
+    }
+
+    private void parseIntObj(Object value, Consumer<Integer> setter) {
+        if (value instanceof Number number) {
+            setter.accept(number.intValue());
+            return;
+        }
+        parseIntStr(stringValue(value), setter);
+    }
+
+    private Object firstNonBlankObject(Object... values) {
+        for (Object value : values) {
+            if (value instanceof String stringValue) {
+                if (notBlank(stringValue)) {
+                    return stringValue;
+                }
+                continue;
+            }
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private String firstNonBlank(String... values) {
+        for (String value : values) {
+            if (notBlank(value)) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private boolean notBlank(String value) {
+        return value != null && !value.isBlank();
+    }
+
+    private String stringValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Document document) {
+            if (document.containsKey("$oid")) {
+                return stringValue(document.get("$oid"));
+            }
+            if (document.containsKey("$date")) {
+                return stringValue(document.get("$date"));
+            }
+            if (document.containsKey("$numberLong")) {
+                return stringValue(document.get("$numberLong"));
+            }
+        }
+        return String.valueOf(value);
+    }
+
+    private String escapeRegex(String value) {
+        return value.replaceAll("[\\\\^$.|?*+()\\[\\]{}]", "\\\\$0");
+    }
+
+    private String dateOnly(String isoValue) {
+        if (isoValue == null || isoValue.length() < 10) {
+            return null;
+        }
+        return isoValue.substring(0, 10).replace("-", "/");
+    }
+
+    private String timeOnly(String isoValue) {
+        if (isoValue == null || isoValue.length() < 19) {
+            return null;
+        }
+        return isoValue.substring(11, 19);
+    }
+
+    private record SearchPlan(Document messageMatch, Document postLookupMatch, boolean requiresLookup) {
+    }
+
+    private record CachedValue<T>(T value, long loadedAtMs) {
+        private boolean isExpired(long ttlMs) {
+            return ttlMs <= 0 || (System.currentTimeMillis() - loadedAtMs) > ttlMs;
+        }
     }
 }

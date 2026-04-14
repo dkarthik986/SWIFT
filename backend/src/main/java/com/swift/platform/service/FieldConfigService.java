@@ -8,278 +8,351 @@ import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.stereotype.Service;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * Dynamically builds the Advanced Search field config for the frontend.
- *
- * NEW SCHEMA (messages collection) — all fields are at the TOP LEVEL.
- * No more "message." prefix on DB paths.
- *
- * Field mapping (frontend param → DB field):
- *   messageType       → messageFamily
- *   messageCode       → messageTypeCode
- *   io                → direction
- *   status            → currentStatus
- *   phase             → statusPhase
- *   action            → statusAction
- *   reason            → statusReason
- *   creationDate      → dateCreated
- *   valueDate         → ampValueDate
- *   sender            → senderAddress
- *   receiver          → receiverAddress
- *   reference         → messageReference
- *   amount            → ampAmount (String, use $expr $toDouble)
- *   ccy               → ampCurrency
- *   networkProtocol   → protocol
- *   deliveryMode      → communicationType
- *   sequenceNumber    → finSequenceNumber
- *   messagePriority   → finMessagePriority
- *   mur               → mtPayload.transactionReference
+ * Builds Advanced Search field config for the split schema.
+ * Known fields keep friendly labels, and nested header fields are
+ * discovered dynamically as extra searchable fields.
  */
 @Service
 @RequiredArgsConstructor
 public class FieldConfigService {
 
-    private final MongoTemplate mongoTemplate;
-    private final AppConfig     appConfig;
+    private volatile CachedValue<List<FieldConfigResponse>> fieldConfigCache;
 
-    // ── Known field metadata ───────────────────────────────────────────────
-    // Format: frontendKey → [label, group, type, backendParam, showInTable]
-    // backendParam = query param name sent to /api/search
-    // DB field name may differ — SearchService.buildQuery handles the mapping
     private static final Map<String, Object[]> FIELD_META = new LinkedHashMap<>();
 
+    private static final Set<String> SKIP_DISCOVERED_PARAMS = Set.of(
+            "_id", "_class", "version", "messageFamily", "messageReference",
+            "messageTypeCode", "messageFormat", "messageTypeDescription",
+            "currentStatus", "status.current", "status.phase", "status.action", "status.reason",
+            "direction", "header.direction", "header.protocol", "header.service", "header.owner",
+            "header.messageTypeCode", "header.messageFormat", "header.messageReference",
+            "header.transactionReference", "header.senderAddress", "header.receiverAddress",
+            "header.networkChannel", "header.networkPriority", "header.workflow", "header.workflowModel",
+            "header.originatorApplication", "header.processingType", "header.processPriority", "header.profileCode",
+            "protocol", "networkChannel", "networkPriority", "service",
+            "senderAddress", "receiverAddress", "senderName", "receiverName",
+            "owner", "workflow", "workflowModel", "originatorApplication",
+            "processingType", "processPriority", "profileCode",
+            "ampAmount", "ampCurrency", "ampValueDate", "extractedFields.currency", "extractedFields.amount", "extractedFields.valueDate",
+            "finMessagePriority", "protocolParams.messagePriority",
+            "finAppId", "protocolParams.appId", "finServiceId", "protocolParams.serviceId",
+            "finLogicalTerminal", "protocolParams.logicalTerminal",
+            "finReceiversAddress", "protocolParams.receiversAddress",
+            "historyLines", "statusHistory", "mtPayload", "mtPayload.rawFields",
+            "payloadDoc.messageReference", "payloadDoc.messageId", "payloadDoc.messageTypeCode", "payloadDoc.messageFormat",
+            "payloadDoc.senderAddress", "payloadDoc.receiverAddress", "payloadDoc.currency", "payloadDoc.amount",
+            "payloadDoc.protocol", "payloadDoc.firstSeenAt", "payloadDoc.lastUpdatedAt",
+            "payloadDoc.digest", "payloadDoc.digestAlgorithm", "payloadDoc.mtParsedPayload.rawFields",
+            "payloadDoc.mtParsedPayload.rawBlock1", "payloadDoc.mtParsedPayload.rawBlock2", "payloadDoc.mtParsedPayload.rawBlock4"
+    );
+
+    private static final Map<String, String> PARAM_TO_DB = Map.ofEntries(
+            Map.entry("messageType", "messageFamily"),
+            Map.entry("messageCode", "header.messageTypeCode"),
+            Map.entry("io", "header.direction"),
+            Map.entry("status", "status.current"),
+            Map.entry("phase", "status.phase"),
+            Map.entry("action", "status.action"),
+            Map.entry("reason", "status.reason"),
+            Map.entry("messagePriority", "protocolParams.messagePriority"),
+            Map.entry("finCopyService", "finCopyService"),
+            Map.entry("possibleDuplicate", "header.pdeIndication"),
+            Map.entry("creationDate", "header.dateCreated"),
+            Map.entry("valueDate", "extractedFields.valueDate"),
+            Map.entry("statusDate", "status.date"),
+            Map.entry("receivedDate", "header.dateReceived"),
+            Map.entry("sender", "header.senderAddress"),
+            Map.entry("receiver", "header.receiverAddress"),
+            Map.entry("senderName", "header.senderName"),
+            Map.entry("receiverName", "header.receiverName"),
+            Map.entry("reference", "messageReference"),
+            Map.entry("transactionReference", "header.transactionReference"),
+            Map.entry("mur", "payloadDoc.mtParsedPayload.transactionReference"),
+            Map.entry("sessionNumber", "protocolParams.sessionNumber"),
+            Map.entry("sequenceNumber", "protocolParams.sequenceNumber"),
+            Map.entry("amount", "extractedFields.amount"),
+            Map.entry("ccy", "extractedFields.currency"),
+            Map.entry("networkProtocol", "header.protocol"),
+            Map.entry("networkChannel", "header.networkChannel"),
+            Map.entry("networkPriority", "header.networkPriority"),
+            Map.entry("deliveryMode", "channel.communicationType"),
+            Map.entry("service", "header.service"),
+            Map.entry("country", "country"),
+            Map.entry("originCountry", "originCountry"),
+            Map.entry("destinationCountry", "destinationCountry"),
+            Map.entry("owner", "header.owner"),
+            Map.entry("workflow", "header.workflow"),
+            Map.entry("workflowModel", "header.workflowModel"),
+            Map.entry("originatorApplication", "header.originatorApplication"),
+            Map.entry("sourceSystem", "header.originatorApplication"),
+            Map.entry("processingType", "header.processingType"),
+            Map.entry("processPriority", "header.processPriority"),
+            Map.entry("profileCode", "header.profileCode"),
+            Map.entry("applicationId", "protocolParams.appId"),
+            Map.entry("serviceId", "protocolParams.serviceId"),
+            Map.entry("logicalTerminalAddress", "protocolParams.logicalTerminal"),
+            Map.entry("historyEntity", "historyLines.entity"),
+            Map.entry("historyDescription", "historyLines.comment"),
+            Map.entry("historyPhase", "historyLines.phase"),
+            Map.entry("historyAction", "historyLines.action"),
+            Map.entry("historyUser", "historyLines.user"),
+            Map.entry("historyChannel", "historyLines.channel"),
+            Map.entry("block4Value", "payloadDoc.mtParsedPayload.rawBlock4"),
+            Map.entry("correspondent", "payloadDoc.senderCorrespondent")
+    );
+
     static {
-        // ── Classification ────────────────────────────────────────────────
-        // DB: messageFamily / messageTypeCode / direction / currentStatus
-        FIELD_META.put("messageType",          new Object[]{"Message Format",          "Classification", "select",       "messageType",               true});
-        FIELD_META.put("messageCode",          new Object[]{"Message Type / Code",     "Classification", "select",       "messageCode",               true});
-        FIELD_META.put("io",                   new Object[]{"Message Direction",       "Classification", "select",       "io",                        true});
-        FIELD_META.put("status",               new Object[]{"Status",                  "Classification", "select",       "status",                    true});
-        FIELD_META.put("messagePriority",      new Object[]{"Message Priority",        "Classification", "select",       "messagePriority",           false});
-        FIELD_META.put("copyIndicator",        new Object[]{"Copy Indicator",          "Classification", "select",       "copyIndicator",             false});
-        FIELD_META.put("finCopyService",       new Object[]{"FIN-COPY Service",        "Classification", "select",       "finCopyService",            true});
-        FIELD_META.put("possibleDuplicate",    new Object[]{"PDE Indication",          "Classification", "boolean",      "possibleDuplicate",         true});
+        FIELD_META.put("messageType", new Object[]{"Message Format", "Classification", "select", "messageType", true});
+        FIELD_META.put("messageCode", new Object[]{"Message Type / Code", "Classification", "select", "messageCode", true});
+        FIELD_META.put("io", new Object[]{"Message Direction", "Classification", "select", "io", true});
+        FIELD_META.put("status", new Object[]{"Status", "Classification", "select", "status", true});
+        FIELD_META.put("messagePriority", new Object[]{"Message Priority", "Classification", "select", "messagePriority", false});
+        FIELD_META.put("copyIndicator", new Object[]{"Copy Indicator", "Classification", "select", "copyIndicator", false});
+        FIELD_META.put("finCopyService", new Object[]{"FIN-COPY Service", "Classification", "select", "finCopyService", true});
+        FIELD_META.put("possibleDuplicate", new Object[]{"PDE Indication", "Classification", "boolean", "possibleDuplicate", true});
 
-        // ── Date & Time ───────────────────────────────────────────────────
-        // DB: dateCreated / ampValueDate / statusDate / dateReceived
-        FIELD_META.put("creationDate",         new Object[]{"Creation Date Range",     "Date & Time",    "date-range",   "startDate,endDate",         true});
-        FIELD_META.put("valueDate",            new Object[]{"Value Date Range",        "Date & Time",    "date-range2",  "valueDateFrom,valueDateTo", true});
-        FIELD_META.put("statusDate",           new Object[]{"Status Date Range",       "Date & Time",    "date-range2",  "statusDateFrom,statusDateTo", false});
-        FIELD_META.put("receivedDate",         new Object[]{"Received Date Range",     "Date & Time",    "date-range2",  "receivedDateFrom,receivedDateTo", false});
+        FIELD_META.put("creationDate", new Object[]{"Creation Date Range", "Date & Time", "date-range", "startDate,endDate", true});
+        FIELD_META.put("valueDate", new Object[]{"Value Date Range", "Date & Time", "date-range2", "valueDateFrom,valueDateTo", true});
+        FIELD_META.put("statusDate", new Object[]{"Status Date Range", "Date & Time", "date-range2", "statusDateFrom,statusDateTo", false});
+        FIELD_META.put("receivedDate", new Object[]{"Received Date Range", "Date & Time", "date-range2", "receivedDateFrom,receivedDateTo", false});
 
-        // ── Parties ───────────────────────────────────────────────────────
-        // DB: senderAddress / receiverAddress / senderName / receiverName
-        FIELD_META.put("sender",               new Object[]{"Sender BIC",              "Parties",        "text",         "sender",                    true});
-        FIELD_META.put("receiver",             new Object[]{"Receiver BIC",            "Parties",        "text",         "receiver",                  true});
-        FIELD_META.put("senderName",           new Object[]{"Sender Institution",      "Parties",        "text",         "senderName",                false});
-        FIELD_META.put("receiverName",         new Object[]{"Receiver Institution",    "Parties",        "text",         "receiverName",              false});
+        FIELD_META.put("sender", new Object[]{"Sender BIC", "Parties", "text", "sender", true});
+        FIELD_META.put("receiver", new Object[]{"Receiver BIC", "Parties", "text", "receiver", true});
+        FIELD_META.put("senderName", new Object[]{"Sender Institution", "Parties", "text", "senderName", false});
+        FIELD_META.put("receiverName", new Object[]{"Receiver Institution", "Parties", "text", "receiverName", false});
+        FIELD_META.put("correspondent", new Object[]{"Correspondent", "Parties", "text", "correspondent", true});
 
-        // ── References ────────────────────────────────────────────────────
-        // DB: messageReference / transactionReference / mtPayload.transactionReference
-        FIELD_META.put("reference",            new Object[]{"Message Reference",       "References",     "text",         "reference",                 true});
-        FIELD_META.put("transactionReference", new Object[]{"Transaction Reference",   "References",     "text",         "transactionReference",      false});
-        FIELD_META.put("mur",                  new Object[]{"MUR (Tag 20)",            "References",     "text",         "mur",                       true});
-        FIELD_META.put("sequenceNumber",       new Object[]{"Sequence No. Range",      "References",     "seq-range",    "seqFrom,seqTo",             true});
+        FIELD_META.put("reference", new Object[]{"Message Reference", "References", "text", "reference", true});
+        FIELD_META.put("transactionReference", new Object[]{"Transaction Reference", "References", "text", "transactionReference", false});
+        FIELD_META.put("mur", new Object[]{"MUR (Tag 20)", "References", "text", "mur", true});
+        FIELD_META.put("sessionNumber", new Object[]{"Session No.", "References", "text", "sessionNumber", true});
+        FIELD_META.put("sequenceNumber", new Object[]{"Sequence No. Range", "References", "seq-range", "seqFrom,seqTo", true});
 
-        // ── Financial ─────────────────────────────────────────────────────
-        // DB: ampAmount (String) / ampCurrency / ampValueDate
-        FIELD_META.put("amount",               new Object[]{"Amount Range",            "Financial",      "amount-range", "amountFrom,amountTo",       true});
-        FIELD_META.put("ccy",                  new Object[]{"Currency (CCY)",          "Financial",      "select",       "ccy",                       true});
+        FIELD_META.put("amount", new Object[]{"Amount Range", "Financial", "amount-range", "amountFrom,amountTo", true});
+        FIELD_META.put("ccy", new Object[]{"Currency (CCY)", "Financial", "select", "ccy", true});
 
-        // ── Routing ───────────────────────────────────────────────────────
-        // DB: protocol / networkChannel / networkPriority / communicationType / service
-        FIELD_META.put("networkProtocol",      new Object[]{"Network Protocol",        "Routing",        "select",       "networkProtocol",           true});
-        FIELD_META.put("networkChannel",       new Object[]{"Network Channel",         "Routing",        "select",       "networkChannel",            true});
-        FIELD_META.put("networkPriority",      new Object[]{"Network Priority",        "Routing",        "select",       "networkPriority",           false});
-        FIELD_META.put("deliveryMode",         new Object[]{"Delivery Mode",           "Routing",        "select",       "deliveryMode",              true});
-        FIELD_META.put("service",              new Object[]{"Service",                 "Routing",        "select",       "service",                   true});
-        FIELD_META.put("backendChannelProtocol",new Object[]{"Backend Channel Protocol","Routing",       "select",       "backendChannelProtocol",    false});
+        FIELD_META.put("networkProtocol", new Object[]{"Network Protocol", "Routing", "select", "networkProtocol", true});
+        FIELD_META.put("networkChannel", new Object[]{"Network Channel", "Routing", "select", "networkChannel", true});
+        FIELD_META.put("networkPriority", new Object[]{"Network Priority", "Routing", "select", "networkPriority", false});
+        FIELD_META.put("deliveryMode", new Object[]{"Delivery Mode", "Routing", "select", "deliveryMode", true});
+        FIELD_META.put("service", new Object[]{"Service", "Routing", "select", "service", true});
+        FIELD_META.put("country", new Object[]{"Country", "Geography", "select", "country", false});
+        FIELD_META.put("originCountry", new Object[]{"Origin Country", "Geography", "select", "originCountry", false});
+        FIELD_META.put("destinationCountry", new Object[]{"Destination Country", "Geography", "select", "destinationCountry", false});
 
-        // ── Geography ─────────────────────────────────────────────────────
-        FIELD_META.put("country",              new Object[]{"Country",                 "Geography",      "select",       "country",                   false});
-        FIELD_META.put("originCountry",        new Object[]{"Origin Country",          "Geography",      "select",       "originCountry",             false});
-        FIELD_META.put("destinationCountry",   new Object[]{"Destination Country",     "Geography",      "select",       "destinationCountry",        false});
+        FIELD_META.put("owner", new Object[]{"Owner / Unit", "Ownership", "select", "owner", true});
+        FIELD_META.put("workflow", new Object[]{"Workflow", "Ownership", "select", "workflow", false});
+        FIELD_META.put("workflowModel", new Object[]{"Workflow Model", "Ownership", "select", "workflowModel", true});
+        FIELD_META.put("originatorApplication", new Object[]{"Originator Application", "Ownership", "select", "originatorApplication", false});
+        FIELD_META.put("sourceSystem", new Object[]{"Source System", "Ownership", "select", "sourceSystem", true});
 
-        // ── Ownership ─────────────────────────────────────────────────────
-        // DB: owner / workflow / workflowModel / originatorApplication
-        FIELD_META.put("owner",                new Object[]{"Owner / Unit",            "Ownership",      "select",       "owner",                     true});
-        FIELD_META.put("workflow",             new Object[]{"Workflow",                "Ownership",      "select",       "workflow",                  false});
-        FIELD_META.put("workflowModel",        new Object[]{"Workflow Model",          "Ownership",      "select",       "workflowModel",             true});
-        FIELD_META.put("originatorApplication",new Object[]{"Originator Application",  "Ownership",      "select",       "originatorApplication",     false});
+        FIELD_META.put("phase", new Object[]{"Phase", "Lifecycle", "select", "phase", true});
+        FIELD_META.put("action", new Object[]{"Action", "Lifecycle", "select", "action", true});
+        FIELD_META.put("reason", new Object[]{"Reason", "Lifecycle", "select", "reason", true});
 
-        // ── Lifecycle ─────────────────────────────────────────────────────
-        // DB: statusPhase / statusAction / statusReason
-        FIELD_META.put("phase",                new Object[]{"Phase",                   "Lifecycle",      "select",       "phase",                     true});
-        FIELD_META.put("action",               new Object[]{"Action",                  "Lifecycle",      "select",       "action",                    true});
-        FIELD_META.put("reason",               new Object[]{"Reason",                  "Lifecycle",      "select",       "reason",                    true});
+        FIELD_META.put("processingType", new Object[]{"Processing Type", "Processing", "select", "processingType", true});
+        FIELD_META.put("processPriority", new Object[]{"Process Priority", "Processing", "select", "processPriority", false});
+        FIELD_META.put("profileCode", new Object[]{"Profile Code", "Processing", "select", "profileCode", false});
 
-        // ── Processing ────────────────────────────────────────────────────
-        // DB: processingType / processPriority / profileCode / channelProtocol
-        FIELD_META.put("processingType",       new Object[]{"Processing Type",         "Processing",     "select",       "processingType",            true});
-        FIELD_META.put("processPriority",      new Object[]{"Process Priority",        "Processing",     "select",       "processPriority",           false});
-        FIELD_META.put("profileCode",          new Object[]{"Profile Code",            "Processing",     "select",       "profileCode",               false});
+        FIELD_META.put("applicationId", new Object[]{"Application ID", "FIN Header", "text", "applicationId", false});
+        FIELD_META.put("serviceId", new Object[]{"Service ID", "FIN Header", "text", "serviceId", false});
+        FIELD_META.put("logicalTerminalAddress", new Object[]{"Logical Terminal", "FIN Header", "text", "logicalTerminalAddress", false});
 
-        // ── FIN Header Fields ─────────────────────────────────────────────
-        // DB: finAppId / finServiceId / finLogicalTerminal / finMessagePriority
-        FIELD_META.put("applicationId",        new Object[]{"Application ID",          "FIN Header",     "text",         "applicationId",             false});
-        FIELD_META.put("serviceId",            new Object[]{"Service ID",              "FIN Header",     "text",         "serviceId",                 false});
-        FIELD_META.put("logicalTerminalAddress",new Object[]{"Logical Terminal",       "FIN Header",     "text",         "logicalTerminalAddress",    false});
+        FIELD_META.put("historyEntity", new Object[]{"History Entity", "History", "text", "historyEntity", false});
+        FIELD_META.put("historyDescription", new Object[]{"History Comment", "History", "text", "historyDescription", false});
+        FIELD_META.put("historyPhase", new Object[]{"History Phase", "History", "select", "historyPhase", false});
+        FIELD_META.put("historyAction", new Object[]{"History Action", "History", "select", "historyAction", false});
+        FIELD_META.put("historyUser", new Object[]{"History User", "History", "text", "historyUser", false});
+        FIELD_META.put("historyChannel", new Object[]{"History Channel", "History", "text", "historyChannel", false});
 
-        // ── History Lines search ──────────────────────────────────────────
-        // historyLines is a TOP-LEVEL array (confirmed in 100-doc dataset)
-        // Entry keys: index, historyDate, phase, action, reason, entity, channel, user, comment
-        FIELD_META.put("historyEntity",        new Object[]{"History Entity",          "History",        "text",         "historyEntity",             false});
-        FIELD_META.put("historyDescription",   new Object[]{"History Comment",         "History",        "text",         "historyDescription",        false});
-        FIELD_META.put("historyPhase",         new Object[]{"History Phase",           "History",        "select",       "historyPhase",              false});
-        FIELD_META.put("historyAction",        new Object[]{"History Action",          "History",        "select",       "historyAction",             false});
-        FIELD_META.put("historyUser",          new Object[]{"History User",            "History",        "text",         "historyUser",               false});
-        FIELD_META.put("historyChannel",       new Object[]{"History Channel",         "History",        "text",         "historyChannel",            false});
-
-        // ── Payload Search ────────────────────────────────────────────────
-        // Search within mtPayload.block4Fields array
-        FIELD_META.put("block4Value",          new Object[]{"Payload Field Value",     "Payload",        "text-wide",    "block4Value",               false});
-
-        // ── Other ─────────────────────────────────────────────────────────
-        // Bug #1 fix: freeSearch removed from FIELD_META.
-        // It was also added manually after the loop, causing it to appear twice
-        // in the API response and show two "Free Search Text" inputs in the UI.
     }
 
-    // Fields to skip during auto-discovery
-    private static final Set<String> SKIP_FIELDS = Set.of(
-            "_id", "_class", "version", "firstSeenAt", "lastUpdatedAt",
-            "mtPayload", "digest", "digestAlgorithm",
-            "digestMCheckResult", "digest2CheckResult",
-            "bulkTotalFileSize", "bulkedFileSize", "bulkTotalMessages", "bulkSequenceNumber",
-            "ampRemittanceInformation", "ampDetailsOfCharges",
-            "finReceiversAddress", "finDirectionId", "finMessageType",
-            "backendChannelCode", "backendChannelDescription",
-            "messageTypeDescription",
-            "historyLines"
-    );
-
-    private static final Set<String> DATE_FIELDS = Set.of(
-            "dateCreated", "dateReceived", "statusDate", "ampValueDate"
-    );
-
-    // Frontend key → DB field for select options lookup
-    private static final Map<String, String> PARAM_TO_DB = Map.ofEntries(
-            Map.entry("messageType",           "messageFamily"),
-            Map.entry("messageCode",           "messageTypeCode"),
-            Map.entry("io",                    "direction"),
-            Map.entry("status",                "currentStatus"),
-            Map.entry("phase",                 "statusPhase"),
-            Map.entry("action",                "statusAction"),
-            Map.entry("reason",                "statusReason"),
-            Map.entry("networkProtocol",       "protocol"),
-            Map.entry("deliveryMode",          "communicationType"),
-            Map.entry("ccy",                   "ampCurrency"),
-            Map.entry("messagePriority",       "finMessagePriority"),
-            Map.entry("sender",                "senderAddress"),
-            Map.entry("receiver",              "receiverAddress"),
-            Map.entry("senderName",            "senderName"),
-            Map.entry("receiverName",          "receiverName"),
-            Map.entry("backendChannelProtocol","channelProtocol")
-    );
+    private final MongoTemplate mongoTemplate;
+    private final AppConfig appConfig;
 
     public List<FieldConfigResponse> getFieldConfig() {
-        String col = appConfig.getSwiftCollection();
-        Set<String> discoveredKeys = discoverTopLevelKeys(col);
+        CachedValue<List<FieldConfigResponse>> cache = fieldConfigCache;
+        if (cache != null && !cache.isExpired(appConfig.getMetadataCacheTtlMs())) {
+            return cache.value();
+        }
 
-        List<FieldConfigResponse> result   = new ArrayList<>();
-        Set<String>               handled  = new LinkedHashSet<>();
+        String messagesCol = appConfig.getSwiftCollection();
+        String payloadsCol = appConfig.getPayloadsCollection();
+
+        List<FieldConfigResponse> result = new ArrayList<>();
+        Set<String> handledBackendParams = new LinkedHashSet<>();
 
         for (Map.Entry<String, Object[]> entry : FIELD_META.entrySet()) {
-            String   key          = entry.getKey();
-            Object[] meta         = entry.getValue();
-            String   label        = (String)  meta[0];
-            String   group        = (String)  meta[1];
-            String   type         = (String)  meta[2];
-            String   backendParam = (String)  meta[3];
-            boolean  showInTable  = (Boolean) meta[4];
+            String key = entry.getKey();
+            Object[] meta = entry.getValue();
+            String label = (String) meta[0];
+            String group = (String) meta[1];
+            String type = (String) meta[2];
+            String backendParam = (String) meta[3];
+            boolean showInTable = (Boolean) meta[4];
 
             List<String> options = Collections.emptyList();
             if ("select".equals(type)) {
-                // Resolve the actual DB field name for distinct query
-                String dbField = PARAM_TO_DB.getOrDefault(key, key);
-                options = distinctValues(dbField, col);
+                options = distinctValues(resolveDbField(backendParam), messagesCol, payloadsCol);
             }
 
             result.add(new FieldConfigResponse(
                     key, label, group, type, options, backendParam,
                     showInTable ? label : null, showInTable
             ));
-            handled.add(key);
+            handledBackendParams.add(resolveDbField(backendParam));
         }
 
-        // Manually add fixed extra fields
         result.add(new FieldConfigResponse(
                 "freeSearch", "Free Search Text", "Other", "text-wide",
-                Collections.emptyList(), "freeSearchText", null, false));
-        handled.add("freeSearch");
+                Collections.emptyList(), "freeSearchText", null, false
+        ));
+        handledBackendParams.add("freeSearchText");
 
-        // Auto-discover additional top-level fields not in FIELD_META
-        for (String key : discoveredKeys) {
-            if (handled.contains(key) || SKIP_FIELDS.contains(key)) continue;
-
-            String type;
-            List<String> options = Collections.emptyList();
-
-            if (DATE_FIELDS.contains(key)) {
-                type = "date-range2";
-            } else {
-                List<String> vals = distinctValues(key, col);
-                if (!vals.isEmpty() && vals.size() <= 50) {
-                    type    = "select";
-                    options = vals;
-                } else {
-                    type = "text";
-                }
+        discoverMessageLeafPaths(messagesCol).forEach(path -> {
+            if (handledBackendParams.contains(path) || SKIP_DISCOVERED_PARAMS.contains(path)) {
+                return;
             }
+            result.add(buildDiscoveredField(path, path, messagesCol, payloadsCol, "Message"));
+        });
 
-            result.add(new FieldConfigResponse(
-                    key, camelToLabel(key), "Discovered", type, options,
-                    key, null, false
-            ));
-        }
-
-        return result;
+        List<FieldConfigResponse> immutable = List.copyOf(result);
+        fieldConfigCache = new CachedValue<>(immutable, System.currentTimeMillis());
+        return immutable;
     }
 
-    /** Scan up to 200 documents to find all TOP-LEVEL keys (not message.* nested) */
-    private Set<String> discoverTopLevelKeys(String col) {
-        Set<String> keys = new LinkedHashSet<>();
+    private FieldConfigResponse buildDiscoveredField(String key, String backendParam,
+                                                     String messagesCol, String payloadsCol, String group) {
+        List<String> options = distinctValues(backendParam, messagesCol, payloadsCol);
+        boolean smallSelect = !options.isEmpty() && options.size() <= 50;
+        return new FieldConfigResponse(
+                key,
+                toPrettyLabel(key),
+                group,
+                smallSelect ? "select" : "text",
+                smallSelect ? options : Collections.emptyList(),
+                backendParam,
+                null,
+                false
+        );
+    }
+
+    private Set<String> discoverMessageLeafPaths(String collection) {
+        Set<String> paths = new LinkedHashSet<>();
         try {
-            Query q = new Query().limit(200);
-            List<Document> docs = mongoTemplate.find(q, Document.class, col);
+            List<Document> docs = mongoTemplate.find(new Query().limit(appConfig.getFieldDiscoverySampleSize()), Document.class, collection);
             for (Document doc : docs) {
-                keys.addAll(doc.keySet());
+                collectLeafPaths(doc, "", paths);
             }
-        } catch (Exception e) {
-            System.err.println("[FieldConfigService] discoverTopLevelKeys failed: " + e.getMessage());
+        } catch (Exception ignored) {
         }
-        return keys;
+        return paths;
     }
 
-    private List<String> distinctValues(String fieldPath, String col) {
+    private Set<String> discoverPayloadLeafPaths(String collection) {
+        Set<String> paths = new LinkedHashSet<>();
         try {
-            return mongoTemplate.findDistinct(new Query(), fieldPath, col, String.class)
-                    .stream().filter(v -> v != null && !v.isBlank()).sorted().collect(Collectors.toList());
-        } catch (Exception e) { return Collections.emptyList(); }
+            List<Document> docs = mongoTemplate.find(new Query().limit(appConfig.getFieldDiscoverySampleSize()), Document.class, collection);
+            for (Document doc : docs) {
+                collectLeafPaths(doc, "", paths);
+            }
+        } catch (Exception ignored) {
+        }
+        return paths;
     }
 
-    private String camelToLabel(String s) {
-        if (s == null || s.isEmpty()) return s;
-        StringBuilder sb = new StringBuilder();
-        sb.append(Character.toUpperCase(s.charAt(0)));
-        for (int i = 1; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (Character.isUpperCase(c)) { sb.append(' '); sb.append(c); }
-            else sb.append(c);
+    private record CachedValue<T>(T value, long loadedAtMs) {
+        private boolean isExpired(long ttlMs) {
+            return ttlMs <= 0 || (System.currentTimeMillis() - loadedAtMs) > ttlMs;
         }
-        return sb.toString();
+    }
+
+    private void collectLeafPaths(Document document, String prefix, Set<String> paths) {
+        for (Map.Entry<String, Object> entry : document.entrySet()) {
+            String key = entry.getKey();
+            if ("_class".equals(key) || "version".equals(key)) {
+                continue;
+            }
+
+            Object value = entry.getValue();
+            String path = prefix.isEmpty() ? key : prefix + "." + key;
+
+            if (value instanceof Document nested) {
+                if (isWrapperDocument(nested)) {
+                    paths.add(path);
+                } else {
+                    collectLeafPaths(nested, path, paths);
+                }
+                continue;
+            }
+
+            if (value instanceof List<?>) {
+                continue;
+            }
+
+            paths.add(path);
+        }
+    }
+
+    private boolean isWrapperDocument(Document document) {
+        return document.size() == 1 && (document.containsKey("$oid") || document.containsKey("$date") || document.containsKey("$numberLong"));
+    }
+
+    private List<String> distinctValues(String backendParam, String messagesCol, String payloadsCol) {
+        String dbField = resolveDbField(backendParam);
+        boolean payloadField = dbField.startsWith("payloadDoc.");
+        String collection = payloadField ? payloadsCol : messagesCol;
+        String fieldPath = payloadField ? dbField.substring("payloadDoc.".length()) : dbField;
+
+        try {
+            return mongoTemplate.findDistinct(new Query(), fieldPath, collection, String.class).stream()
+                    .filter(value -> value != null && !value.isBlank())
+                    .sorted()
+                    .collect(Collectors.toList());
+        } catch (Exception ignored) {
+            return Collections.emptyList();
+        }
+    }
+
+    private String resolveDbField(String backendParam) {
+        return PARAM_TO_DB.getOrDefault(backendParam, backendParam);
+    }
+
+    private String toPrettyLabel(String key) {
+        String normalized = key.replace("payload.", "Payload ").replace('.', ' ').replace('_', ' ').replace('-', ' ');
+        StringBuilder label = new StringBuilder();
+        for (int i = 0; i < normalized.length(); i++) {
+            char current = normalized.charAt(i);
+            if (i > 0 && Character.isUpperCase(current) && Character.isLowerCase(normalized.charAt(i - 1))) {
+                label.append(' ');
+            }
+            label.append(current);
+        }
+        String collapsed = label.toString().trim().replaceAll("\\s+", " ");
+        String[] words = collapsed.split(" ");
+        StringBuilder titled = new StringBuilder();
+        for (String word : words) {
+            if (word.isEmpty()) {
+                continue;
+            }
+            if (!titled.isEmpty()) {
+                titled.append(' ');
+            }
+            titled.append(Character.toUpperCase(word.charAt(0)));
+            if (word.length() > 1) {
+                titled.append(word.substring(1));
+            }
+        }
+        return titled.toString();
     }
 }

@@ -2,11 +2,17 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from "react"
 import "./Search.css";
 import "./RawCopies.css";
 import { useAuth } from "../AuthContext";
+
+// ── All API endpoints read from .env — no hardcoded URLs ─────────────────────
 const API_BASE_URL      = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search`;
+const API_EXPORT_ALL_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/export-all`;
+const API_DETAIL_BY_REF_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/detail/by-reference`;
+const API_DETAILS_BY_REFS_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/details/by-references`;
 const API_DROPDOWN_URL   = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/dropdown-options`;
 const API_FIELD_CFG_URL  = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/field-config`;
 const API_RAW_COPIES_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/raw-copies`;
 
+// ── MT/MX pair map ────────────────────────────────────────────────────────────
 const BASE_MT_MX_PAIRS = {
     "MT103/pacs.008": ["MT103", "pacs.008"],
     "MT199/pacs.002": ["MT199", "pacs.002"],
@@ -15,9 +21,14 @@ const BASE_MT_MX_PAIRS = {
     "MT940/camt.053": ["MT940", "camt.053"],
 };
 let allMtMxTypeMap = { ...BASE_MT_MX_PAIRS };
+
+// Bug #7 fix: previous code used new Date(y, m, d) where m came from splitting
+// "YYYY/MM/DD" — making it 1-indexed while Date() expects 0-indexed months.
+// For end-of-month dates this caused overflow: Jan 31 → Mar 3 instead of Feb 28.
 const addOneMonth = (dateStr) => {
     if (!dateStr) return "";
     const [y, m, d] = dateStr.split("/").map(Number);
+    // Advance month correctly: m is 1-indexed, convert to 0-indexed for Date(), then +1
     let ny = y, nm = m; // still 1-indexed
     if (nm === 12) { ny += 1; nm = 1; } else { nm += 1; }
     // Clamp day to actual days in target month
@@ -59,7 +70,7 @@ const formatDirection = (val) => {
     if (!val) return "—";
     const v = String(val).trim().toUpperCase();
     if (v === "I") return "INCOMING";
-    if (v === "O") return "OUTGOING"; 
+    if (v === "O") return "OUTGOING";
     return v;
 };
 const dirClass = (val) => {
@@ -119,7 +130,7 @@ const toPrettyLabel = (key) => {
     if (!key) return "";
     return String(key)
         .replace(/([a-z])([A-Z])/g, "$1 $2")
-        .replace(/[_-]+/g, " ")
+        .replace(/[._-]+/g, " ")
         .replace(/\s+/g, " ")
         .trim()
         .replace(/\b\w/g, ch => ch.toUpperCase());
@@ -133,6 +144,113 @@ const stringifyExportValue = (value) => {
     try { return JSON.stringify(value); } catch { return String(value); }
 };
 
+const HEADER_DYNAMIC_ORDER = [
+    "messageTypeCode", "messageTypeName", "messageTypeDescription", "messageFormat",
+    "messageReference", "transactionReference", "dateCreated", "dateReceived",
+    "direction", "protocol", "service", "profileCode", "owner", "originatorApplication",
+    "networkPriority", "processPriority", "processingType", "workflow", "workflowModel",
+    "backendChannel", "networkChannel", "pdeIndication",
+];
+const HEADER_PARTY_KEYS = new Set(["senderAddress", "senderName", "receiverAddress", "receiverName"]);
+const DETAIL_SKIP_PATHS = new Set(["_class", "version"]);
+const LEGACY_DETAIL_FIELDS = [["id","ID"],["messageType","FORMAT"],["messageCode","TYPE"],["messageTypeDescription","DESCRIPTION"],["io","DIRECTION"],["status","STATUS"],["phase","PHASE"],["action","ACTION"],["reason","REASON"],["statusMessage","STATUS MESSAGE"],["statusChangeSource","STATUS SOURCE"],["statusDecision","STATUS DECISION"],["reference","MESSAGE REF"],["transactionReference","TXN REF"],["mur","MUR (TAG 20)"],["sender","SENDER"],["receiver","RECEIVER"],["senderInstitutionName","SENDER NAME"],["receiverInstitutionName","RECEIVER NAME"],["amount","AMOUNT"],["ccy","CURRENCY"],["valueDate","VALUE DATE"],["networkProtocol","PROTOCOL"],["networkChannel","NETWORK CHANNEL"],["networkPriority","NETWORK PRIORITY"],["deliveryMode","DELIVERY MODE"],["service","SERVICE"],["backendChannel","BACKEND CHANNEL"],["backendChannelProtocol","CHANNEL PROTOCOL"],["workflow","WORKFLOW"],["workflowModel","WORKFLOW MODEL"],["owner","OWNER"],["processingType","PROCESSING TYPE"],["processPriority","PROCESS PRIORITY"],["profileCode","PROFILE CODE"],["originatorApplication","ORIGINATOR APP"],["sessionNumber","SESSION NO"],["sequenceNumber","SEQUENCE NO"],["creationDate","CREATED"],["receivedDT","RECEIVED"],["statusDate","STATUS DATE"],["valueDate","VALUE DATE"],["bankOperationCode","BANK OP CODE"],["detailsOfCharges","CHARGES"],["remittanceInfo","REMITTANCE"],["applicationId","APP ID"],["serviceId","SERVICE ID"],["logicalTerminalAddress","LOGICAL TERMINAL"],["messagePriority","MSG PRIORITY"],["pdeIndication","PDE"],["bulkType","BULK TYPE"],["nrIndicator","NR IND"],["channelCode","CHANNEL CODE"]];
+
+const isPlainObject = (value) => value && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date);
+const unwrapMetaObject = (value) => {
+    if (!isPlainObject(value)) return value;
+    const keys = Object.keys(value);
+    if (keys.length === 1 && (keys[0] === "$oid" || keys[0] === "$date" || keys[0] === "$numberLong")) {
+        return value[keys[0]];
+    }
+    return value;
+};
+
+const buildObjectPairs = (source, preferredKeys = [], excludedKeys = new Set()) => {
+    if (!isPlainObject(source)) return [];
+    const orderedKeys = [...preferredKeys.filter(key => key in source), ...Object.keys(source).filter(key => !preferredKeys.includes(key))];
+    return orderedKeys
+        .filter(key => !excludedKeys.has(key))
+        .map(key => ({ key, label: toPrettyLabel(key), val: unwrapMetaObject(source[key]) }))
+        .filter(item => item.val !== undefined && item.val !== null && item.val !== "");
+};
+
+const getLegacyHeaderPairs = (msg, raw = {}) => [
+    { key: "messageCode", label: "Message Code", val: msg.messageCode || getDisplayType(msg) },
+    { key: "messageFormat", label: "Message Format", val: raw.messageFormat || getDisplayFormat(msg) },
+    { key: "reference", label: "Reference", val: msg.reference },
+    { key: "transactionReference", label: "Transaction Reference", val: msg.transactionReference },
+    { key: "transferReference", label: "Transfer Reference", val: msg.transferReference },
+    { key: "mur", label: "MUR", val: msg.mur || msg.userReference },
+    { key: "creationDate", label: "Creation Date", val: msg.creationDate || msg.date },
+    { key: "receivedDT", label: "Received", val: msg.receivedDT },
+    { key: "remittanceInfo", label: "Remittance", val: msg.remittanceInfo },
+    { key: "uetr", label: "UETR", val: msg.uetr },
+    { key: "workflow", label: "Workflow", val: msg.workflow },
+    { key: "environment", label: "Environment", val: msg.environment },
+    { key: "statusMessage", label: "Status Message", val: msg.statusMessage },
+].filter(item => item.val !== undefined && item.val !== null && item.val !== "");
+
+const getHeaderPairs = (msg) => {
+    const raw = msg.rawMessage || {};
+    const header = raw.header || {};
+    return [
+        { key: "messageType", label: "Message Type", val: getDisplayType(msg) || msg.messageCode || header.messageTypeCode },
+        { key: "protocol", label: "Protocol", val: header.protocol || msg.networkProtocol || msg.protocol },
+        { key: "sender", label: "Sender", val: header.senderAddress || msg.sender },
+        { key: "service", label: "Service", val: header.service || msg.service },
+        { key: "receiver", label: "Receiver", val: header.receiverAddress || msg.receiver },
+        { key: "messageReference", label: "Message Reference", val: header.messageReference || msg.reference || msg.messageReference },
+        { key: "transactionReference", label: "Transaction Reference", val: header.transactionReference || msg.transactionReference },
+    ].filter(item => item.val !== undefined && item.val !== null && item.val !== "");
+};
+
+const getHeaderExportPairs = (msg) => getHeaderPairs(msg);
+
+const flattenObjectFields = (source, prefix = "", out = []) => {
+    if (!isPlainObject(source)) return out;
+    Object.entries(source).forEach(([key, rawValue]) => {
+        const path = prefix ? `${prefix}.${key}` : key;
+        if (DETAIL_SKIP_PATHS.has(key) || DETAIL_SKIP_PATHS.has(path)) return;
+        const value = unwrapMetaObject(rawValue);
+        if (value === undefined || value === null || value === "") return;
+        if (isPlainObject(value)) {
+            flattenObjectFields(value, path, out);
+            return;
+        }
+        out.push({ key: path, label: toPrettyLabel(path), val: value });
+    });
+    return out;
+};
+
+const getLegacyDetailPairs = (msg, raw = {}) => {
+    const shown = new Set();
+    const ordered = [];
+    LEGACY_DETAIL_FIELDS.forEach(([key, label]) => {
+        const val = raw[key] ?? msg[key];
+        if (val !== undefined && val !== null && val !== "") {
+            ordered.push({ key, label, val });
+            shown.add(key);
+        }
+    });
+    Object.entries(raw).forEach(([key, value]) => {
+        if (!shown.has(key) && key !== "mtPayload" && key !== "block4Fields" && key !== "rawFin" && value !== undefined && value !== null && value !== "") {
+            ordered.push({ key, label: key.toUpperCase(), val: value });
+        }
+    });
+    return ordered;
+};
+
+const getDetailPairs = (msg) => {
+    const raw = msg.rawMessage || {};
+    const flattened = flattenObjectFields(raw);
+    return flattened.length ? flattened : getLegacyDetailPairs(msg, raw);
+};
+
+const getRawPayloadText = (msg) => {
+    const raw = msg.rawMessage || {};
+    return msg.rawFin || raw.mtPayload?.rawFin || raw.mtPayload?.rawBlock4 || raw.body?.rawPayload || "—";
+};
+
 const escapeCsvCell = (value) => `"${stringifyExportValue(value).replace(/"/g, "\"\"")}"`;
 const safeFileNamePart = (value) => String(value || "").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 70);
 
@@ -144,6 +262,21 @@ const triggerDownload = (blob, filename) => {
     a.click();
     setTimeout(() => URL.revokeObjectURL(url), 0);
 };
+
+const EXPORT_FORMAT_OPTIONS = [
+    { key: "csv", iconText: "CSV", iconClass: "export-icon-csv", name: "Comma Separated", ext: ".csv" },
+    { key: "excel", iconText: "XLS", iconClass: "export-icon-xlsx", name: "Excel Workbook", ext: ".xlsx" },
+    { key: "json", iconText: "JSON", iconClass: "export-icon-json", name: "JSON Data", ext: ".json" },
+    { key: "pdf", iconText: "PDF", iconClass: "export-icon-pdf", name: "Portable Document", ext: ".pdf" },
+    { key: "word", iconText: "DOC", iconClass: "export-icon-word", name: "Word Document", ext: ".doc" },
+    { key: "xml", iconText: "XML", iconClass: "export-icon-xml", name: "XML Data", ext: ".xml" },
+    { key: "txt", iconText: "TXT", iconClass: "export-icon-txt", name: "Plain Text", ext: ".txt" },
+    { key: "rje", iconText: "RJE", iconClass: "export-icon-rje", name: "Remote Job Entry", ext: ".rje", rawPayloadOnly: true, mtOnly: true },
+    { key: "dospcc", iconText: "DOS", iconClass: "export-icon-dospcc", name: "DOSPCC", ext: ".dos", rawPayloadOnly: true, mtOnly: true },
+];
+
+const MT_RAW_ONLY_EXPORT_FORMATS = new Set(["rje", "dospcc"]);
+const RESULT_TABLE_EXPORT_FORMATS = new Set(["csv", "excel", "pdf"]);
 
 const loadScriptOnce = (src, checkReady) => new Promise((resolve, reject) => {
     if (checkReady()) { resolve(); return; }
@@ -162,15 +295,27 @@ const loadScriptOnce = (src, checkReady) => new Promise((resolve, reject) => {
     document.head.appendChild(sc);
 });
 
+const escapeHtml = (value) => stringifyExportValue(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+const htmlText = (value) => {
+    const text = stringifyExportValue(value ?? "—") || "—";
+    return escapeHtml(text).replace(/\r?\n/g, "<br />");
+};
+
 const buildWordHtml = (title, columns, rows) => {
-    const th = columns.map(c => `<th>${c.label}</th>`).join("");
-    const body = rows.map(row => `<tr>${columns.map(c => `<td>${stringifyExportValue(row[c.key]).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</td>`).join("")}</tr>`).join("");
+    const th = columns.map(c => `<th>${escapeHtml(c.label)}</th>`).join("");
+    const body = rows.map(row => `<tr>${columns.map(c => `<td>${htmlText(row[c.key])}</td>`).join("")}</tr>`).join("");
     return `
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8" />
-<title>${title}</title>
+<title>${escapeHtml(title)}</title>
 <style>
 body { font-family: Arial, sans-serif; padding: 16px; color: #111827; }
 h2 { margin: 0 0 12px; font-size: 18px; }
@@ -180,13 +325,268 @@ th { background: #f3f4f6; font-weight: 700; }
 </style>
 </head>
 <body>
-<h2>${title}</h2>
+<h2>${escapeHtml(title)}</h2>
 <table>
 <thead><tr>${th}</tr></thead>
 <tbody>${body}</tbody>
 </table>
 </body>
 </html>`;
+};
+
+const triggerWordDownload = (html, fileBaseName) => {
+    triggerDownload(new Blob(["\ufeff", html], { type: "application/msword;charset=utf-8" }), `${fileBaseName}.doc`);
+};
+
+const getWordRenderableColumns = (columns, rows) => {
+    const filtered = (columns || []).filter((column) => {
+        if (column.key === "index") return false;
+        return (rows || []).some((row) => {
+            const value = stringifyExportValue(row?.[column.key] ?? "—") || "—";
+            return value && value !== "—";
+        });
+    });
+    return filtered.length ? filtered : (columns || []).filter(column => column.key !== "index");
+};
+
+const buildWordComponentExportHtml = ({ title, documents }) => {
+    const renderTable = ({ columns, rows, pairMode = false }) => {
+        const header = columns.map((column) => `<th>${escapeHtml(column.label)}</th>`).join("");
+        const body = (rows.length ? rows : [{}]).map((row) => (
+            `<tr>${columns.map((column, index) => `
+                <td${pairMode && index === 0 ? ' class="word-label-cell"' : ""}>${htmlText(row?.[column.key] ?? "—")}</td>
+            `).join("")}</tr>`
+        )).join("");
+        return `
+            <table class="word-table${pairMode ? " word-pair-table" : ""}">
+                <thead><tr>${header}</tr></thead>
+                <tbody>${body}</tbody>
+            </table>
+        `;
+    };
+
+    const renderSection = (section) => {
+        const rawHtml = section.type === "raw"
+            ? `<pre class="word-raw-block">${escapeHtml(section.rawText || "—")}</pre>`
+            : "";
+        if (section.type === "raw") {
+            return `
+                <section class="word-section">
+                    <h2 class="word-section-title">${escapeHtml(section.label)}</h2>
+                    ${rawHtml}
+                </section>
+            `;
+        }
+
+        return `
+            <section class="word-section">
+                <h2 class="word-section-title">${escapeHtml(section.label)}</h2>
+                ${renderTable({ columns: section.columns, rows: section.rows, pairMode: section.type === "pair" })}
+            </section>
+        `;
+    };
+
+    const body = (documents || []).map((doc) => `
+        <article class="word-message${doc.pageBreak ? " word-page-break" : ""}">
+            ${doc.pageLabel ? `<div class="word-page-label">${escapeHtml(doc.pageLabel)}</div>` : ""}
+            <div class="word-message-ref">Message Ref: ${escapeHtml(doc.messageRef || "—")}</div>
+            ${doc.summaryLine ? `<div class="word-message-summary">${escapeHtml(doc.summaryLine)}</div>` : ""}
+            <div class="word-message-rule"></div>
+            ${(doc.sections || []).map(renderSection).join("")}
+        </article>
+    `).join("");
+
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>${escapeHtml(title || "Export")}</title>
+<style>
+@page { margin: 0.6in 0.45in; }
+body { font-family: "Segoe UI", Arial, sans-serif; margin: 0; padding: 0; color: #111827; background: #ffffff; }
+.word-page-break { page-break-before: always; }
+.word-message { margin: 0; }
+.word-page-label { text-align: right; font-size: 11pt; font-weight: 700; color: #153263; margin: 0 0 12px; }
+.word-message-ref { font-size: 18pt; font-weight: 700; color: #111827; margin: 0 0 8px; }
+.word-message-summary { font-size: 12pt; color: #64748b; margin: 0 0 14px; letter-spacing: 0.02em; }
+.word-message-rule { border-top: 1px solid #cbd5e1; margin: 0 0 18px; }
+.word-section { margin: 0 0 18px; page-break-inside: avoid; }
+.word-section-title { margin: 0 0 10px; font-size: 15pt; font-weight: 700; color: #213863; page-break-after: avoid; }
+.word-table { border-collapse: collapse; width: 100%; font-size: 11pt; table-layout: fixed; }
+.word-table thead { display: table-header-group; }
+.word-table tr { page-break-inside: avoid; }
+.word-table th, .word-table td { border: 1px solid #dbe3ef; padding: 7px 10px; vertical-align: top; text-align: left; word-break: break-word; }
+.word-table th { background: #f3f4f6; color: #374151; font-weight: 700; }
+.word-table tbody tr:nth-child(even) td { background: #f8fafc; }
+.word-pair-table th:first-child, .word-pair-table td:first-child { width: 32%; }
+.word-label-cell { font-weight: 700; color: #64748b; }
+.word-raw-block { margin: 0; padding: 14px 16px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; color: #111827; font-family: Consolas, "Courier New", monospace; font-size: 9.5pt; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+${body}
+</body>
+</html>`;
+};
+
+const buildStructuredSectionData = (block) => {
+    const columns = Array.isArray(block?.columns) ? block.columns : [];
+    const rows = Array.isArray(block?.rows) ? block.rows : [];
+    const hasFieldValue = columns.some(col => col.key === "field") && columns.some(col => col.key === "value");
+
+    if (hasFieldValue) {
+        return rows.reduce((acc, row, index) => {
+            const key = stringifyExportValue(row?.field || `Field ${index + 1}`) || `Field ${index + 1}`;
+            acc[key] = row?.value ?? "—";
+            return acc;
+        }, {});
+    }
+
+    if (rows.length === 1) {
+        const single = rows[0] || {};
+        return columns.reduce((acc, column) => {
+            if (column.key === "index" || column.label === "#") return acc;
+            acc[column.label] = single[column.key] ?? "—";
+            return acc;
+        }, {});
+    }
+
+    return rows.map((row) => columns.reduce((acc, column) => {
+        if (column.key === "index" || column.label === "#") return acc;
+        acc[column.label] = row?.[column.key] ?? "—";
+        return acc;
+    }, {}));
+};
+
+const buildSectionJsonData = ({ targetKey, block, meta = {} }) => {
+    if (targetKey === "rawpayload") {
+        const rawValue = block?.rows?.[0]?.value ?? block?.rows?.[0]?.rawPayload ?? "â€”";
+        return stringifyExportValue(rawValue || "â€”") || "â€”";
+    }
+
+    const structured = buildStructuredSectionData(block);
+    if (targetKey === "header") {
+        return {
+            messageType: meta.messageType ?? "â€”",
+            messageFormat: meta.messageFormat ?? "â€”",
+            messageReference: meta.messageReference ?? "â€”",
+            ...structured,
+        };
+    }
+
+    return structured;
+};
+
+const isWordExportDisabledForTargets = (selectedTargets = []) => Array.isArray(selectedTargets) && selectedTargets.includes("rawcopies");
+
+const getExportFormatOptions = ({ targetKey, includeMtOnly = false, selectedTargets = [] }) => EXPORT_FORMAT_OPTIONS.map(option => {
+    const disabled = option.key === "word" && isWordExportDisabledForTargets(selectedTargets);
+    const disabledReason = disabled ? "Word export is unavailable when Raw Copies is selected." : "";
+    return { ...option, disabled, disabledReason };
+}).filter(option => {
+    if (targetKey === "table" && !RESULT_TABLE_EXPORT_FORMATS.has(option.key)) return false;
+    if (option.rawPayloadOnly && targetKey !== "rawpayload") return false;
+    if (option.mtOnly && !includeMtOnly) return false;
+    return true;
+});
+
+const normalizeFinPayloadText = (value) => {
+    const text = typeof value === "string" ? value : stringifyExportValue(value);
+    return text.replace(/\r?\n/g, "\r\n").trim();
+};
+
+const isMtMessage = (msg) => {
+    const format = normalizeFormat(msg?.format || msg?.messageFormat || msg?.rawMessage?.messageFormat || "");
+    if (String(format).toUpperCase() === "MT") return true;
+    const type = String(msg?.messageCode || msg?.type || "").trim().toUpperCase();
+    if (/^MT\d{3}/.test(type)) return true;
+    const rawPayload = getRawPayloadText(msg);
+    return typeof rawPayload === "string" && rawPayload.trim().startsWith("{1:");
+};
+
+const collectMtRawPayloads = (messages = []) => {
+    const payloads = [];
+    let skippedNonMt = 0;
+    let skippedMissing = 0;
+
+    (messages || []).forEach((msg) => {
+        if (!isMtMessage(msg)) {
+            skippedNonMt += 1;
+            return;
+        }
+        const rawPayload = normalizeFinPayloadText(getRawPayloadText(msg));
+        if (!rawPayload || rawPayload === "—") {
+            skippedMissing += 1;
+            return;
+        }
+        payloads.push(rawPayload);
+    });
+
+    return {
+        payloads,
+        skippedNonMt,
+        skippedMissing,
+    };
+};
+
+const encodeAsciiBytes = (text) => {
+    const bytes = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i += 1) bytes[i] = text.charCodeAt(i) & 0xff;
+    return bytes;
+};
+
+const concatUint8Arrays = (chunks) => {
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    chunks.forEach((chunk) => {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    });
+    return out;
+};
+
+const buildRjeContent = (payloads) => `${payloads.join("$")}$`;
+
+const buildDosPccBytes = (payloads) => {
+    const sectorSize = 512;
+    const chunks = payloads.map((payload) => {
+        const body = encodeAsciiBytes(payload);
+        const framed = new Uint8Array(body.length + 2);
+        framed[0] = 0x01; // SOH
+        framed.set(body, 1);
+        framed[framed.length - 1] = 0x03; // ETX
+
+        const paddedLength = Math.ceil(framed.length / sectorSize) * sectorSize;
+        const padded = new Uint8Array(paddedLength);
+        padded.fill(0x20);
+        padded.set(framed, 0);
+        return padded;
+    });
+
+    return concatUint8Arrays(chunks);
+};
+
+const exportMtRawPayloads = ({ format, messages, fileBaseName }) => {
+    const { payloads, skippedNonMt, skippedMissing } = collectMtRawPayloads(messages);
+    if (payloads.length === 0) {
+        throw new Error("RJE / DOSPCC export requires MT messages with raw payload data.");
+    }
+
+    if (format === "rje") {
+        const content = buildRjeContent(payloads);
+        triggerDownload(new Blob([content], { type: "text/plain;charset=us-ascii" }), `${fileBaseName}.rje`);
+        return { exportedCount: payloads.length, skippedNonMt, skippedMissing };
+    }
+
+    if (format === "dospcc") {
+        const bytes = buildDosPccBytes(payloads);
+        triggerDownload(new Blob([bytes], { type: "application/octet-stream" }), `${fileBaseName}.dos`);
+        return { exportedCount: payloads.length, skippedNonMt, skippedMissing };
+    }
+
+    throw new Error(`Unsupported MT raw export format: ${format}`);
 };
 
 const clampNumber = (value, min, max) => Math.min(max, Math.max(min, value));
@@ -218,7 +618,7 @@ const getPdfRepeatColumns = (columns) => {
     return [];
 };
 
-const exportRawCopiesPdf = async ({ base, exportTitle, rows, columns }) => {
+const exportRawCopiesPdf = async ({ base, exportTitle, rows, columns, showPdfTitle = true }) => {
     await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js", () => !!window.jspdf?.jsPDF);
     await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js", () => !!window.jspdf?.jsPDF?.API?.autoTable);
 
@@ -234,10 +634,12 @@ const exportRawCopiesPdf = async ({ base, exportTitle, rows, columns }) => {
     let cursorY = margin.top;
 
     const drawPageHeader = () => {
-        doc.setFont("helvetica", "bold");
-        doc.setFontSize(12);
-        doc.setTextColor(17, 24, 39);
-        doc.text(exportTitle, margin.left, 28);
+        if (showPdfTitle) {
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(12);
+            doc.setTextColor(17, 24, 39);
+            doc.text(exportTitle, margin.left, 28);
+        }
         doc.setFont("helvetica", "normal");
         doc.setFontSize(8);
         doc.text(`Page ${doc.getNumberOfPages()}`, pageWidth - margin.right, 28, { align: "right" });
@@ -257,8 +659,8 @@ const exportRawCopiesPdf = async ({ base, exportTitle, rows, columns }) => {
     resetPageCursor();
 
     rows.forEach((row, idx) => {
-        const copyTitle = row.messageId && row.messageId !== "—"
-            ? `Copy ${idx + 1} - ${row.messageId}`
+        const copyTitle = row.messageReference && row.messageReference !== "—"
+            ? `Copy ${idx + 1} - ${row.messageReference}`
             : `Copy ${idx + 1}`;
         const metaPairs = metaColumns
             .map(col => [col.label, stringifyExportValue(row?.[col.key])])
@@ -352,7 +754,7 @@ const exportRawCopiesPdf = async ({ base, exportTitle, rows, columns }) => {
     doc.save(`${base}.pdf`);
 };
 
-const exportFieldPairsPdf = async ({ base, exportTitle, rows, columns }) => {
+const exportFieldPairsPdf = async ({ base, exportTitle, rows, columns, showPdfTitle = true }) => {
     await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js", () => !!window.jspdf?.jsPDF);
     await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js", () => !!window.jspdf?.jsPDF?.API?.autoTable);
 
@@ -362,15 +764,17 @@ const exportFieldPairsPdf = async ({ base, exportTitle, rows, columns }) => {
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
     const contentWidth = pageWidth - margin.left - margin.right;
-    const pairColumns = ["recordNo", "field", "value"];
+    const pairColumns = ["field", "value"];
     const metaColumns = columns.filter(col => !pairColumns.includes(col.key));
     let cursorY = margin.top;
 
     const drawPageHeader = () => {
-        doc.setFont("helvetica", "bold");
-        doc.setFontSize(12);
-        doc.setTextColor(17, 24, 39);
-        doc.text(exportTitle, margin.left, 28);
+        if (showPdfTitle) {
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(12);
+            doc.setTextColor(17, 24, 39);
+            doc.text(exportTitle, margin.left, 28);
+        }
         doc.setFont("helvetica", "normal");
         doc.setFontSize(8);
         doc.text(`Page ${doc.getNumberOfPages()}`, pageWidth - margin.right, 28, { align: "right" });
@@ -505,7 +909,7 @@ const exportFieldPairsPdf = async ({ base, exportTitle, rows, columns }) => {
     doc.save(`${base}.pdf`);
 };
 
-const exportRowsAsFile = async ({ format, rows, columns, fileBaseName, title, sheetName }) => {
+const exportRowsAsFile = async ({ format, rows, columns, fileBaseName, title, sheetName, forceGenericPdf = false, showPdfTitle = true }) => {
     const safeRows = Array.isArray(rows) ? rows : [];
     const safeColumns = (columns && columns.length > 0)
         ? columns
@@ -561,13 +965,13 @@ const exportRowsAsFile = async ({ format, rows, columns, fileBaseName, title, sh
     }
 
     if (format === "pdf") {
-        if (safeColumns.some(c => c.key === "rawInput")) {
-            await exportRawCopiesPdf({ base, exportTitle, rows: safeRows, columns: safeColumns });
+        if (!forceGenericPdf && safeColumns.some(c => c.key === "rawInput")) {
+            await exportRawCopiesPdf({ base, exportTitle, rows: safeRows, columns: safeColumns, showPdfTitle });
             return;
         }
 
-        if (safeColumns.some(c => c.key === "field") && safeColumns.some(c => c.key === "value")) {
-            await exportFieldPairsPdf({ base, exportTitle, rows: safeRows, columns: safeColumns });
+        if (!forceGenericPdf && safeColumns.some(c => c.key === "field") && safeColumns.some(c => c.key === "value")) {
+            await exportFieldPairsPdf({ base, exportTitle, rows: safeRows, columns: safeColumns, showPdfTitle });
             return;
         }
 
@@ -622,9 +1026,11 @@ const exportRowsAsFile = async ({ format, rows, columns, fileBaseName, title, sh
                 ? { horizontalPageBreakRepeat: repeatColumns.length === 1 ? repeatColumns[0] : repeatColumns }
                 : {}),
             didDrawPage: ({ pageNumber }) => {
-                doc.setFontSize(12);
-                doc.setTextColor(17, 24, 39);
-                doc.text(exportTitle, margin.left, 28);
+                if (showPdfTitle) {
+                    doc.setFontSize(12);
+                    doc.setTextColor(17, 24, 39);
+                    doc.text(exportTitle, margin.left, 28);
+                }
                 doc.setFontSize(8);
                 doc.text(`Page ${pageNumber}`, doc.internal.pageSize.getWidth() - margin.right, 28, { align: "right" });
             },
@@ -645,6 +1051,8 @@ const exportRowsAsFile = async ({ format, rows, columns, fileBaseName, title, sh
 // ── Table columns ─────────────────────────────────────────────────────────────
 const COLUMNS = [
     { key: "sequenceNumber",      label: "Seq No.",         sortable: true },
+    { key: "sessionNumber",       label: "Session No.",     sortable: true },
+    { key: "logicalTerminalAddress", label: "Logical Terminal", sortable: true },
     { key: "format",              label: "Format",          sortable: true },
     { key: "type",                label: "Type",            sortable: true },
     { key: "date",                label: "Date",            sortable: true },
@@ -686,6 +1094,8 @@ const COLUMNS = [
 
 const FIXED_TABLE_COLUMN_KEYS = new Set([
     "sequenceNumber",
+    "sessionNumber",
+    "logicalTerminalAddress",
     "format",
     "type",
     "date",
@@ -713,11 +1123,10 @@ const FIXED_TABLE_COLUMNS = COLUMNS.filter(col => FIXED_TABLE_COLUMN_KEYS.has(co
 const MAIN_EXPORT_TARGETS = [
     { key: "table", label: "Result Table" },
     { key: "header", label: "Header" },
-    { key: "body", label: "Body" },
-    { key: "rawcopies", label: "Raw Copies" },
-    { key: "payload", label: "FIN Payload" },
-    { key: "details", label: "All Fields" },
+    { key: "rawpayload", label: "Raw Payload" },
+    { key: "payload", label: "Extended text" },
     { key: "history", label: "History" },
+    { key: "details", label: "All Fields" },
 ];
 
 const FIELD_DEFINITIONS = [
@@ -739,6 +1148,7 @@ const FIELD_DEFINITIONS = [
     { key: "mur",                  label: "User Reference (MUR)",    group: "References",     type: "text",         placeholder: "MUR",                                            stateKeys: ["userReference"],                            colKeys: ["userReference"],      backendParam: "mur"                   },
     { key: "reference",            label: "Reference",               group: "References",     type: "text",         placeholder: "Reference",                                      stateKeys: ["reference"],                                colKeys: [],                     backendParam: "reference"             },
     { key: "transactionReference", label: "Transaction Reference",   group: "References",     type: "text",         placeholder: "Transaction Reference",                          stateKeys: ["transactionReference"],                     colKeys: [],                     backendParam: "transactionReference"  },
+    { key: "sessionNumber",        label: "Session No.",             group: "References",     type: "text",         placeholder: "e.g. 0001",                                     stateKeys: ["sessionNumber"],                            colKeys: ["sessionNumber"],      backendParam: "sessionNumber"         },
     { key: "transferReference",    label: "Transfer Reference",      group: "References",     type: "text",         placeholder: "Transfer Reference",                             stateKeys: ["transferReference"],                        colKeys: [],                     backendParam: "transferReference"     },
     { key: "relatedReference",     label: "Related Reference",       group: "References",     type: "text",         placeholder: "Related Reference",                              stateKeys: ["relatedReference"],                         colKeys: [],                     backendParam: "relatedReference"      },
     { key: "uetr",                 label: "UETR",                    group: "References",     type: "text",         placeholder: "Enter UETR (e.g. 8a562c65-...)",                 stateKeys: ["uetr"],                                     colKeys: ["uetr"],               backendParam: "uetr"                  },
@@ -802,6 +1212,38 @@ const STATIC_FIELD_DEF_MAP = new Map(FIELD_DEFINITIONS.map(def => [def.key, def]
 
 const resolveFieldKey = (key) => FIELD_KEY_ALIASES[key] || key;
 
+const buildAdvancedDerivedColumns = (selectedDefs, rows = []) => {
+    const derived = [];
+    const seen = new Set();
+    selectedDefs.forEach(def => {
+        const explicitColKeys = def.colKeys || [];
+        if (explicitColKeys.length > 0) return;
+
+        const candidateKeys = [
+            ...(def.stateKeys || []),
+            def.key,
+            def.backendParam,
+        ].filter(Boolean);
+
+        const displayKey = candidateKeys.find(key =>
+            !seen.has(key) &&
+            key !== "reference" &&
+            key !== "messageReference" &&
+            rows.some(row => row && row[key] !== undefined && row[key] !== null && row[key] !== "")
+        );
+
+        if (!displayKey) return;
+        seen.add(displayKey);
+        derived.push({
+            key: displayKey,
+            label: def.columnLabel || def.label,
+            sortable: true,
+            isDynamic: true,
+        });
+    });
+    return derived;
+};
+
 const normalizeDynamicField = (field) => {
     const resolvedKey = resolveFieldKey(field.key);
     const baseDef = STATIC_FIELD_DEF_MAP.get(resolvedKey);
@@ -861,7 +1303,8 @@ const getDynamicExtraColumns = (fields) => {
 };
 
 const FIELD_GROUPS = ["Classification", "Date & Time", "Parties", "References", "Financial", "Routing", "Ownership", "Lifecycle", "Processing", "Compliance", "History", "Other"];
-const ADV_BASE_COLS = new Set(["sequenceNumber", "format", "type", "date", "time"]);
+const ADV_HIDDEN_GROUPS = new Set(["Payload"]);
+const ADV_BASE_COLS = new Set(["sequenceNumber", "sessionNumber", "format", "type", "date", "time"]);
 const SORT_NONE = null, SORT_ASC = "asc", SORT_DESC = "desc";
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const DAYS   = ["Su","Mo","Tu","We","Th","Fr","Sa"];
@@ -872,7 +1315,7 @@ const initialSearchState = {
     status:"", currency:"", userReference:"", rfkReference:"",
     messageReference:"", uetr:"", finCopy:"", action:"", reason:"",
     correspondent:"", amountFrom:"", amountTo:"", seqFrom:"",
-    seqTo:"", ownerUnit:"", freeSearchText:"", backendChannel:"", phase:"",
+    seqTo:"", sessionNumber:"", ownerUnit:"", freeSearchText:"", backendChannel:"", phase:"",
     country:"", workflow:"", networkChannel:"", networkPriority:"",
     reference:"", transactionReference:"", transferReference:"",
     historyEntity:"", historyDescription:"", historyPhase:"", historyAction:"", historyUser:"", historyChannel:"",
@@ -885,13 +1328,14 @@ const initialSearchState = {
     processingType:"", processPriority:"", profileCode:"", environment:"", nack:"",
     amlStatus:"", amlDetails:"",
     messagePriority:"", copyIndicator:"", possibleDuplicate:"", crossBorder:"",
+    logicalTerminalAddress:"",
     valueDateFrom:"", valueDateTo:"",
     receivedDateFrom:"", receivedDateTo:"",
     statusDateFrom:"", statusDateTo:"",
 };
 
 const initialRcFilters = {
-    messageReference: "", messageId: "", sender: "", receiver: "",
+    messageReference: "", sender: "", receiver: "",
     messageTypeCode: "", direction: "", currentStatus: "", protocol: "",
     inputType: "", source: "", startDate: "", endDate: "", freeText: "",
 };
@@ -1097,7 +1541,7 @@ function FloatingModal({
     const modalExportRef = useRef(null);
 
     const [modalExportOpen, setModalExportOpen] = useState(false);
-    const [modalExportTarget, setModalExportTarget] = useState("tab");
+    const [modalExportTargets, setModalExportTargets] = useState([tab]);
     const [modalExporting, setModalExporting] = useState(false);
 
     // ── Raw Copies for this message ───────────────────────────────────────
@@ -1106,6 +1550,7 @@ function FloatingModal({
     const [modalRcError,   setModalRcError]   = useState(null);
     const [modalRcExpanded,setModalRcExpanded]= useState(null);
     const [modalRcCopied,  setModalRcCopied]  = useState(null);
+    const [detailLoading,  setDetailLoading]  = useState(false);
 
     const { id, msg, tab, pos, size, zIndex, index, _flash } = modal;
     const notify = useCallback((text, type = "info") => {
@@ -1124,6 +1569,14 @@ function FloatingModal({
         msg.time,
     ].map(v => String(v ?? "")).join("|");
     const modalBaseName = `swift_popup_${safeFileNamePart(modalRefValue || msg.sequenceNumber || "message")}`;
+    const hasModalDetailData = Boolean(
+        msg.rawMessage ||
+        (Array.isArray(msg.block4Fields) && msg.block4Fields.length) ||
+        (Array.isArray(msg.historyLines) && msg.historyLines.length) ||
+        (msg.rawFin && msg.rawFin !== "—")
+    );
+    const tabNeedsDetailData = ["rawpayload", "payload", "history", "details"].includes(tab);
+    const showDetailLoading = detailLoading && tabNeedsDetailData && !hasModalDetailData;
 
     // Flash animation when duplicate window is focused
     useEffect(() => {
@@ -1191,22 +1644,18 @@ function FloatingModal({
 
     const modalTabs = [
         {
-            key: "header",
-            label: "Header",
+            key: "rawpayload",
+            label: "Raw Payload",
         },
         {
-            key: "body",
-            label: "Body",
+            key: "payload",
+            label: "Extended text",
+            count: (msg.block4Fields || msg.rawMessage?.mtPayload?.block4Fields || []).length,
         },
         {
             key: "history",
             label: "History",
             count: (msg.historyLines || msg.rawMessage?.historyLines || []).length,
-        },
-        {
-            key: "payload",
-            label: "FIN Payload",
-            count: (msg.block4Fields || msg.rawMessage?.mtPayload?.block4Fields || []).length,
         },
         {
             key: "rawcopies",
@@ -1219,39 +1668,58 @@ function FloatingModal({
         },
     ];
 
-    const activeTabLabel = {
-        header: "Header",
-        body: "Body",
-        history: "History",
-        payload: "FIN Payload",
-        rawcopies: "Raw Copies",
-        details: "All Fields",
-    }[tab] || "Section";
+    const orderedModalExportTargets = modalExportTargets.length ? modalExportTargets : [tab];
+    const resolvedModalExportTarget = orderedModalExportTargets.length === 1 ? orderedModalExportTargets[0] : "";
+    const modalExportFormats = useMemo(() => getExportFormatOptions({
+        targetKey: resolvedModalExportTarget,
+        includeMtOnly: orderedModalExportTargets.length === 1 && resolvedModalExportTarget === "rawpayload" && isMtMessage(msg),
+        selectedTargets: orderedModalExportTargets,
+    }), [resolvedModalExportTarget, orderedModalExportTargets, msg]);
+
+    const toggleModalExportTarget = useCallback((targetKey) => {
+        setModalExportTargets((prev) => {
+            if (prev.includes(targetKey)) return prev.length === 1 ? prev : prev.filter(key => key !== targetKey);
+            return [...prev, targetKey];
+        });
+    }, []);
+
+    useEffect(() => {
+        if (tab === "body" || tab === "header") onPatch(id, { tab: "history" });
+    }, [tab, id, onPatch]);
+
+    useEffect(() => {
+        if (!modalRefValue || hasModalDetailData) {
+            setDetailLoading(false);
+            return;
+        }
+        let alive = true;
+        setDetailLoading(true);
+        fetch(`${API_DETAIL_BY_REF_URL}/${encodeURIComponent(modalRefValue)}`, {
+            headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) }
+        })
+            .then(r => {
+                if (!r.ok) throw new Error(`Detail fetch failed (${r.status})`);
+                return r.json();
+            })
+            .then(detail => {
+                if (!alive || !detail) return;
+                onPatch(id, { msg: detail });
+            })
+            .catch(() => {})
+            .finally(() => {
+                if (alive) setDetailLoading(false);
+            });
+        return () => { alive = false; };
+    }, [id, modalRefValue, modalMessageKey, hasModalDetailData, onPatch, token]);
 
     const getSectionData = useCallback((sectionKey, rcDataOverride = modalRcData) => {
         const raw = msg.rawMessage || {};
         if (sectionKey === "header") {
-            const pairs = [
-                ["Message Code", msg.messageCode || getDisplayType(msg)],
-                ["Message Format", raw.messageFormat || getDisplayFormat(msg)],
-                ["Reference", msg.reference],
-                ["Transaction Reference", msg.transactionReference],
-                ["Transfer Reference", msg.transferReference],
-                ["MUR", msg.mur || msg.userReference],
-                ["Creation Date", msg.creationDate || msg.date],
-                ["Received", msg.receivedDT],
-                ["Remittance", msg.remittanceInfo],
-                ["UETR", msg.uetr],
-                ["Workflow", msg.workflow],
-                ["Environment", msg.environment],
-                ["Status Message", msg.statusMessage],
-                ["Sender", msg.sender],
-                ["Receiver", msg.receiver],
-            ].filter(([, v]) => v !== undefined && v !== null && v !== "");
+            const pairs = getHeaderExportPairs(msg);
             return {
                 label: "Header",
                 columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
-                rows: pairs.map(([field, value]) => ({ field, value: stringifyExportValue(value) })),
+                rows: pairs.map(item => ({ field: item.label, value: stringifyExportValue(item.val) })),
             };
         }
 
@@ -1286,7 +1754,6 @@ function FloatingModal({
             return {
                 label: "History",
                 columns: [
-                    { key: "index", label: "#" },
                     { key: "dateTime", label: "Date Time" },
                     { key: "phase", label: "Phase" },
                     { key: "action", label: "Action" },
@@ -1296,8 +1763,7 @@ function FloatingModal({
                     { key: "user", label: "User" },
                     { key: "comment", label: "Comment" },
                 ],
-                rows: lines.map((line, idx) => ({
-                    index: line.index || idx + 1,
+                rows: lines.map((line) => ({
                     dateTime: line.historyDate ? new Date(line.historyDate).toLocaleString("en-US", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }) : "—",
                     phase: line.phase || "—",
                     action: line.action || "—",
@@ -1313,40 +1779,30 @@ function FloatingModal({
         if (sectionKey === "payload") {
             const lines = msg.block4Fields || raw.mtPayload?.block4Fields || [];
             return {
-                label: "FIN Payload",
+                label: "Extended text",
                 columns: [
-                    { key: "index", label: "#" },
                     { key: "tag", label: "Tag" },
                     { key: "label", label: "Field Label" },
                     { key: "rawValue", label: "Raw Value" },
-                    { key: "components", label: "Components" },
                 ],
-                rows: lines.map((line, idx) => ({
-                    index: idx + 1,
+                rows: lines.map((line) => ({
                     tag: line.tag || "—",
-                    label: line.label || "—",
+                    label: line.label || (line.tag ? `Tag ${line.tag}` : "—"),
                     rawValue: line.rawValue || "—",
-                    components: line.components && Object.keys(line.components).length > 0 ? JSON.stringify(line.components) : "—",
                 })),
             };
         }
 
+        if (sectionKey === "rawpayload") {
+            return {
+                label: "Raw Payload",
+                columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
+                rows: [{ field: "Raw Payload", value: stringifyExportValue(getRawPayloadText(msg)) }],
+            };
+        }
+
         if (sectionKey === "details") {
-            const ALL_FIELDS = [["id","ID"],["messageType","FORMAT"],["messageCode","TYPE"],["messageTypeDescription","DESCRIPTION"],["io","DIRECTION"],["status","STATUS"],["phase","PHASE"],["action","ACTION"],["reason","REASON"],["statusMessage","STATUS MESSAGE"],["statusChangeSource","STATUS SOURCE"],["statusDecision","STATUS DECISION"],["reference","MESSAGE REF"],["transactionReference","TXN REF"],["mur","MUR (TAG 20)"],["sender","SENDER"],["receiver","RECEIVER"],["senderInstitutionName","SENDER NAME"],["receiverInstitutionName","RECEIVER NAME"],["amount","AMOUNT"],["ccy","CURRENCY"],["valueDate","VALUE DATE"],["networkProtocol","PROTOCOL"],["networkChannel","NETWORK CHANNEL"],["networkPriority","NETWORK PRIORITY"],["deliveryMode","DELIVERY MODE"],["service","SERVICE"],["backendChannel","BACKEND CHANNEL"],["backendChannelProtocol","CHANNEL PROTOCOL"],["workflow","WORKFLOW"],["workflowModel","WORKFLOW MODEL"],["owner","OWNER"],["processingType","PROCESSING TYPE"],["processPriority","PROCESS PRIORITY"],["profileCode","PROFILE CODE"],["originatorApplication","ORIGINATOR APP"],["sessionNumber","SESSION NO"],["sequenceNumber","SEQUENCE NO"],["creationDate","CREATED"],["receivedDT","RECEIVED"],["statusDate","STATUS DATE"],["valueDate","VALUE DATE"],["bankOperationCode","BANK OP CODE"],["detailsOfCharges","CHARGES"],["remittanceInfo","REMITTANCE"],["applicationId","APP ID"],["serviceId","SERVICE ID"],["logicalTerminalAddress","LOGICAL TERMINAL"],["messagePriority","MSG PRIORITY"],["pdeIndication","PDE"],["bulkType","BULK TYPE"],["nrIndicator","NR IND"],["channelCode","CHANNEL CODE"]];
-            const shown = new Set();
-            const ordered = [];
-            ALL_FIELDS.forEach(([k, label]) => {
-                const val = raw[k] ?? msg[k];
-                if (val !== undefined && val !== null && val !== "") {
-                    ordered.push({ label, val });
-                    shown.add(k);
-                }
-            });
-            Object.entries(raw).forEach(([k, v]) => {
-                if (!shown.has(k) && k !== "mtPayload" && k !== "block4Fields" && k !== "rawFin" && v !== undefined && v !== null && v !== "") {
-                    ordered.push({ label: k.toUpperCase(), val: v });
-                }
-            });
+            const ordered = getDetailPairs(msg);
             return {
                 label: "All Fields",
                 columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
@@ -1355,9 +1811,8 @@ function FloatingModal({
         }
 
         if (sectionKey === "rawcopies") {
-            const rows = (rcDataOverride?.copies || []).map((row, idx) => ({
-                index: idx + 1,
-                messageId: row.messageId || "—",
+            const rows = (rcDataOverride?.copies || []).map((row) => ({
+                messageReference: row.messageReference || "—",
                 messageTypeCode: row.messageTypeCode || "—",
                 direction: row.direction || "—",
                 currentStatus: row.currentStatus || "—",
@@ -1372,8 +1827,7 @@ function FloatingModal({
             return {
                 label: "Raw Copies",
                 columns: [
-                    { key: "index", label: "#" },
-                    { key: "messageId", label: "Message ID" },
+                    { key: "messageReference", label: "Message Reference" },
                     { key: "messageTypeCode", label: "Type" },
                     { key: "direction", label: "Direction" },
                     { key: "currentStatus", label: "Status" },
@@ -1392,44 +1846,347 @@ function FloatingModal({
         return { label: "Section", columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }], rows: [] };
     }, [modalRcData, msg, getDisplayType, getDisplayFormat, formatDirection]);
 
-    const exportModalData = async (targetKey, format) => {
+    const exportOrderedModalSectionsPdf = useCallback(async (orderedKeys, rcData) => {
+        await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js", () => !!window.jspdf?.jsPDF);
+        await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js", () => !!window.jspdf?.jsPDF?.API?.autoTable);
+
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+        const margin = { top: 48, right: 34, bottom: 34, left: 34 };
+        const pageWidth = doc.internal.pageSize.getWidth();
+        const pageHeight = doc.internal.pageSize.getHeight();
+        const contentWidth = pageWidth - margin.left - margin.right;
+        let cursorY = margin.top;
+
+        const drawPageHeader = () => {
+            doc.setFont("helvetica", "normal");
+            doc.setFontSize(8);
+            doc.text(`Page ${doc.getNumberOfPages()}`, pageWidth - margin.right, 28, { align: "right" });
+        };
+
+        const resetPageCursor = () => {
+            cursorY = margin.top;
+            drawPageHeader();
+        };
+
+        const ensureSpace = (neededHeight) => {
+            if (cursorY + neededHeight <= pageHeight - margin.bottom) return;
+            doc.addPage();
+            resetPageCursor();
+        };
+
+        const drawSectionHeading = (label) => {
+            ensureSpace(20);
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(10);
+            doc.setTextColor(33, 56, 99);
+            doc.text(label, margin.left, cursorY);
+            cursorY += 8;
+        };
+
+        const drawPairTable = (pairs) => {
+            doc.autoTable({
+                startY: cursorY,
+                margin,
+                tableWidth: contentWidth,
+                theme: "grid",
+                head: [["Field", "Value"]],
+                body: pairs.length ? pairs : [["Field", "—"]],
+                styles: {
+                    fontSize: 8.25,
+                    cellPadding: { top: 4, right: 5, bottom: 4, left: 5 },
+                    overflow: "linebreak",
+                    valign: "top",
+                    lineColor: [226, 232, 240],
+                    lineWidth: 0.35,
+                },
+                headStyles: {
+                    fillColor: [243, 244, 246],
+                    textColor: [55, 65, 81],
+                    fontStyle: "bold",
+                    fontSize: 8.25,
+                },
+                columnStyles: {
+                    0: { cellWidth: 170, fontStyle: "bold", textColor: [100, 116, 139] },
+                    1: { cellWidth: contentWidth - 170, textColor: [17, 24, 39] },
+                },
+                didDrawPage: () => drawPageHeader(),
+            });
+            cursorY = (doc.lastAutoTable?.finalY || cursorY) + 12;
+        };
+
+        const drawDataTable = (columns, rows) => {
+            const safeColumns = columns.filter((column) => {
+                if (column.key === "index") return true;
+                return rows.some((row) => {
+                    const value = stringifyExportValue(row?.[column.key]);
+                    return value && value !== "—";
+                });
+            });
+            const widths = estimatePdfColumnWidths(safeColumns, rows);
+            const totalWidth = widths.reduce((sum, width) => sum + width, 0) || 1;
+            const scale = totalWidth > contentWidth ? contentWidth / totalWidth : 1;
+            const scaled = widths.map((width) => Math.max(48, width * scale));
+            const fontSize = safeColumns.length > 7 ? 6.5 : safeColumns.length > 4 ? 7.25 : 8;
+
+            doc.autoTable({
+                startY: cursorY,
+                margin,
+                tableWidth: contentWidth,
+                theme: "grid",
+                head: [safeColumns.map((column) => column.label)],
+                body: (rows.length ? rows : [{}]).map((row) => safeColumns.map((column) => stringifyExportValue(row?.[column.key] ?? "—") || "—")),
+                styles: {
+                    fontSize,
+                    cellPadding: { top: 4, right: 4, bottom: 4, left: 4 },
+                    overflow: "linebreak",
+                    valign: "top",
+                    lineColor: [226, 232, 240],
+                    lineWidth: 0.35,
+                },
+                headStyles: {
+                    fillColor: [243, 244, 246],
+                    textColor: [55, 65, 81],
+                    fontStyle: "bold",
+                    fontSize,
+                },
+                columnStyles: Object.fromEntries(scaled.map((width, index) => [index, { cellWidth: width }])),
+                didDrawPage: () => drawPageHeader(),
+            });
+            cursorY = (doc.lastAutoTable?.finalY || cursorY) + 12;
+        };
+
+        const drawRawPayloadBlock = (text) => {
+            const rawText = stringifyExportValue(text || "—") || "—";
+            const lineHeight = 8.5;
+            const codePadding = 8;
+            const wrappedLines = doc.splitTextToSize(rawText, contentWidth - (codePadding * 2));
+            let offset = 0;
+
+            while (offset < wrappedLines.length) {
+                ensureSpace(34);
+                const availableHeight = pageHeight - margin.bottom - cursorY - (codePadding * 2);
+                const linesPerPage = Math.max(1, Math.floor(availableHeight / lineHeight));
+                const lineChunk = wrappedLines.slice(offset, offset + linesPerPage);
+                const boxHeight = (lineChunk.length * lineHeight) + (codePadding * 2);
+
+                doc.setFillColor(248, 250, 252);
+                doc.setDrawColor(226, 232, 240);
+                doc.roundedRect(margin.left, cursorY, contentWidth, boxHeight, 6, 6, "FD");
+                doc.setFont("courier", "normal");
+                doc.setFontSize(7);
+                doc.setTextColor(17, 24, 39);
+                doc.text(lineChunk, margin.left + codePadding, cursorY + codePadding + 5);
+
+                cursorY += boxHeight + 10;
+                offset += linesPerPage;
+            }
+        };
+
+        resetPageCursor();
+        const messageRef = modalRefValue || msg.sequenceNumber || "—";
+
+        ensureSpace(30);
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(11);
+        doc.setTextColor(17, 24, 39);
+        doc.text(`Message Ref: ${messageRef}`, margin.left, cursorY);
+        cursorY += 14;
+
+        const summaryLine = [getDisplayType(msg), getDisplayFormat(msg), formatDirection(msg.io || msg.direction)].filter(Boolean).join("   ");
+        if (summaryLine) {
+            doc.setFont("helvetica", "normal");
+            doc.setFontSize(8);
+            doc.setTextColor(100, 116, 139);
+            doc.text(summaryLine, margin.left, cursorY);
+            cursorY += 10;
+        }
+
+        doc.setDrawColor(203, 213, 225);
+        doc.line(margin.left, cursorY, pageWidth - margin.right, cursorY);
+        cursorY += 14;
+
+        orderedKeys.forEach((targetKey) => {
+            const block = getSectionData(targetKey, rcData);
+            drawSectionHeading(block.label);
+
+            if (targetKey === "rawpayload") {
+                drawRawPayloadBlock(getRawPayloadText(msg));
+                return;
+            }
+
+            const blockColumns = targetKey === "rawcopies"
+                ? block.columns.filter((column) => !["senderAddress", "receiverAddress", "protocol", "receivedAt", "inputType", "source"].includes(column.key))
+                : block.columns;
+            const isPairBlock = blockColumns.length === 2 && blockColumns.some(col => col.key === "field") && blockColumns.some(col => col.key === "value");
+
+            if (isPairBlock) {
+                drawPairTable(block.rows.map((row) => [stringifyExportValue(row.field || "—"), stringifyExportValue(row.value || "—")]));
+                return;
+            }
+
+            if (block.rows.length === 1 && blockColumns.length > 4) {
+                const single = block.rows[0] || {};
+                drawPairTable(blockColumns.map((column) => [column.label, stringifyExportValue(single[column.key] ?? "—") || "—"]));
+                return;
+            }
+
+            drawDataTable(blockColumns, block.rows);
+        });
+
+        doc.save(`${modalBaseName}_${safeFileNamePart(orderedKeys.map(key => getSectionData(key, rcData).label).join("_").toLowerCase().replace(/\s+/g, "_"))}.pdf`);
+    }, [getSectionData, getDisplayType, getDisplayFormat, msg, modalBaseName, modalRefValue, safeFileNamePart]);
+
+    const exportOrderedModalSectionsWord = useCallback((orderedKeys, rcData) => {
+        const summaryLine = [getDisplayType(msg), getDisplayFormat(msg), formatDirection(msg.io || msg.direction)].filter(Boolean).join("   ");
+        const sections = orderedKeys.map((targetKey) => {
+            const block = getSectionData(targetKey, rcData);
+            const blockColumns = targetKey === "rawcopies"
+                ? block.columns.filter((column) => !["senderAddress", "receiverAddress", "protocol", "receivedAt", "inputType", "source"].includes(column.key))
+                : block.columns;
+            const isPairBlock = blockColumns.length === 2 && blockColumns.some(col => col.key === "field") && blockColumns.some(col => col.key === "value");
+
+            if (targetKey === "rawpayload") {
+                return { label: block.label, type: "raw", rawText: stringifyExportValue(getRawPayloadText(msg) || "—") || "—" };
+            }
+
+            if (isPairBlock) {
+                return {
+                    label: block.label,
+                    type: "pair",
+                    columns: blockColumns,
+                    rows: block.rows.map((row) => ({
+                        field: stringifyExportValue(row.field || "—") || "—",
+                        value: stringifyExportValue(row.value || "—") || "—",
+                    })),
+                };
+            }
+
+            if (block.rows.length === 1 && blockColumns.length > 4) {
+                const single = block.rows[0] || {};
+                return {
+                    label: block.label,
+                    type: "pair",
+                    columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
+                    rows: blockColumns.map((column) => ({
+                        field: column.label,
+                        value: stringifyExportValue(single[column.key] ?? "—") || "—",
+                    })),
+                };
+            }
+
+            const safeColumns = getWordRenderableColumns(blockColumns, block.rows);
+            return {
+                label: block.label,
+                type: "table",
+                columns: safeColumns,
+                rows: (block.rows.length ? block.rows : [{}]).map((row) => Object.fromEntries(
+                    safeColumns.map((column) => [column.key, stringifyExportValue(row?.[column.key] ?? "—") || "—"])
+                )),
+            };
+        });
+
+        const html = buildWordComponentExportHtml({
+            title: `${orderedKeys.map(key => getSectionData(key, rcData).label).join(" + ")} - ${getDisplayType(msg) || "Message"}`,
+            documents: [{
+                pageLabel: "Page 1",
+                messageRef: modalRefValue || msg.sequenceNumber || "—",
+                summaryLine,
+                sections,
+            }],
+        });
+
+        triggerWordDownload(
+            html,
+            `${modalBaseName}_${safeFileNamePart(orderedKeys.map(key => getSectionData(key, rcData).label).join("_").toLowerCase().replace(/\s+/g, "_"))}`
+        );
+    }, [formatDirection, getDisplayFormat, getDisplayType, getSectionData, modalBaseName, modalRefValue, msg, safeFileNamePart]);
+
+    const buildOrderedModalSectionJson = useCallback((orderedKeys, rcData) => {
+        const meta = {
+            messageReference: modalRefValue || msg.reference || msg.messageReference || msg.sequenceNumber || "â€”",
+            messageType: getDisplayType(msg) || msg.messageCode || "â€”",
+            messageFormat: getDisplayFormat(msg) || "â€”",
+        };
+
+        return {
+            messageReference: meta.messageReference,
+            sections: orderedKeys.map((targetKey) => {
+                const block = getSectionData(targetKey, rcData);
+                return {
+                    section: block.label,
+                    data: buildSectionJsonData({ targetKey, block, meta }),
+                };
+            }),
+        };
+    }, [getSectionData, getDisplayFormat, getDisplayType, modalRefValue, msg]);
+
+    const exportModalData = async (targetKeys, format) => {
         setModalExportOpen(false);
         setModalExporting(true);
         try {
+            const orderedKeys = Array.isArray(targetKeys) && targetKeys.length ? targetKeys : [tab];
+            const resolvedKey = orderedKeys.length === 1 ? orderedKeys[0] : "";
+            if (format === "word" && isWordExportDisabledForTargets(orderedKeys)) {
+                throw new Error("Word export is unavailable when Raw Copies is selected.");
+            }
+            if (MT_RAW_ONLY_EXPORT_FORMATS.has(format)) {
+                if (orderedKeys.length !== 1 || resolvedKey !== "rawpayload") throw new Error("RJE / DOSPCC export is available only when Raw Payload is the only selected section.");
+                exportMtRawPayloads({
+                    format,
+                    messages: [msg],
+                    fileBaseName: `${modalBaseName}_raw_payload`,
+                });
+                notify(`Exported Raw Payload as ${format.toUpperCase()}`);
+                return;
+            }
+
             let rcData = modalRcData;
-            const resolvedKey = targetKey === "tab" ? tab : targetKey;
-            if ((resolvedKey === "rawcopies" || resolvedKey === "all") && !rcData && modalRefValue) {
+            if (orderedKeys.includes("rawcopies") && !rcData && modalRefValue) {
                 rcData = await fetchModalRawCopies();
                 setModalRcData(rcData);
             }
 
-            if (resolvedKey === "all") {
-                const keys = ["header", "body", "history", "payload", "details", "rawcopies"];
-                const blocks = keys.map(k => ({ ...getSectionData(k, rcData) }));
+            if (format === "json") {
+                const mergedLabel = orderedKeys.map(key => getSectionData(key, rcData).label).join(" + ");
+                const payload = buildOrderedModalSectionJson(orderedKeys, rcData);
+                triggerDownload(
+                    new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
+                    `${modalBaseName}_${safeFileNamePart(mergedLabel.toLowerCase().replace(/\s+/g, "_"))}.json`
+                );
+                notify(`Exported ${mergedLabel} as JSON`);
+                return;
+            }
+
+            if (format === "pdf") {
+                await exportOrderedModalSectionsPdf(orderedKeys, rcData);
+                notify(`Exported ${orderedKeys.map(key => getSectionData(key, rcData).label).join(" + ")} as PDF`);
+            } else if (format === "word") {
+                exportOrderedModalSectionsWord(orderedKeys, rcData);
+                notify(`Exported ${orderedKeys.map(key => getSectionData(key, rcData).label).join(" + ")} as Word`);
+            } else if (orderedKeys.length > 1) {
+                const blocks = orderedKeys.map(k => ({ ...getSectionData(k, rcData) }));
                 const mergedRows = [];
                 const keySet = new Set(["section"]);
                 blocks.forEach(block => {
-                    const hasNativeIndex = block.columns?.some(col => col.key === "index" || col.label === "#");
-                    block.rows.forEach((row, idx) => {
+                    block.rows.forEach((row) => {
                         const merged = { section: block.label };
-                        if (!hasNativeIndex) {
-                            merged.recordNo = idx + 1;
-                            keySet.add("recordNo");
-                        }
                         Object.entries(row).forEach(([k, v]) => { merged[k] = v; keySet.add(k); });
                         mergedRows.push(merged);
                     });
                 });
-                const columns = [...keySet].map(k => ({ key: k, label: k === "recordNo" ? "#" : toPrettyLabel(k) }));
+                const columns = [...keySet].map(k => ({ key: k, label: toPrettyLabel(k) }));
+                const mergedLabel = orderedKeys.map(key => getSectionData(key, rcData).label).join(" + ");
                 await exportRowsAsFile({
                     format,
                     rows: mergedRows,
                     columns,
-                    fileBaseName: `${modalBaseName}_all_components`,
-                    title: `All Components - ${getDisplayType(msg) || "Message"}`,
-                    sheetName: "All Components",
+                    fileBaseName: `${modalBaseName}_${safeFileNamePart(mergedLabel.toLowerCase().replace(/\s+/g, "_"))}`,
+                    title: `${mergedLabel} - ${getDisplayType(msg) || "Message"}`,
+                    sheetName: mergedLabel,
+                    showPdfTitle: false,
                 });
-                notify(`Exported all popup components as ${format.toUpperCase()}`);
+                notify(`Exported ${mergedLabel} as ${format.toUpperCase()}`);
             } else {
                 const section = getSectionData(resolvedKey, rcData);
                 await exportRowsAsFile({
@@ -1439,6 +2196,7 @@ function FloatingModal({
                     fileBaseName: `${modalBaseName}_${safeFileNamePart(section.label.toLowerCase().replace(/\s+/g, "_"))}`,
                     title: `${section.label} - ${getDisplayType(msg) || "Message"}`,
                     sheetName: section.label,
+                    showPdfTitle: false,
                 });
                 notify(`Exported ${section.label} as ${format.toUpperCase()}`);
             }
@@ -1587,13 +2345,29 @@ function FloatingModal({
             <div className="txn-header fm-drag-header" onMouseDown={onDragStart}>
                 <div className="txn-header-left">
                     <div className="txn-type-pill">{getDisplayFormat(msg)}</div>
-                    <div>
-                        <div className="txn-title">{getDisplayType(msg)||"Transaction"}</div>
-                        <div className="txn-subtitle">{msg.date}{msg.time&&<span> · {msg.time}</span>}</div>
+                    <div className="txn-meta-wrap">
+                        <div className="txn-meta-line">
+                            {[
+                                (msg.statusDate || msg.creationDate)
+                                    ? new Date(msg.statusDate || msg.creationDate).toLocaleString("en-GB", {
+                                        year: "numeric",
+                                        month: "2-digit",
+                                        day: "2-digit",
+                                        hour: "2-digit",
+                                        minute: "2-digit",
+                                        second: "2-digit",
+                                        hour12: false,
+                                    })
+                                    : "—",
+                                formatDirection(msg.io || msg.direction),
+                                msg.phase || "—",
+                                msg.action || "—",
+                                msg.status || "—",
+                            ].join(" / ")}
+                        </div>
                     </div>
                 </div>
                 <div className="txn-header-right" onMouseDown={e => e.stopPropagation()}>
-                    <span className={"txn-status-badge "+statusCls(msg.status)}>{msg.status||"—"}</span>
                     <div className="txn-nav">
                         <button className="txn-nav-btn" onClick={()=>onPrev(id)} disabled={isFirst}>
                             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="15 18 9 12 15 6"/></svg>
@@ -1604,7 +2378,7 @@ function FloatingModal({
                         </button>
                     </div>
                     <div className="txn-export-wrap" ref={modalExportRef}>
-                        <button className="txn-export-btn" onClick={()=>{ if (!modalExporting) { setModalExportTarget("tab"); setModalExportOpen(p=>!p); } }} disabled={modalExporting}>
+                        <button className="txn-export-btn" onClick={()=>{ if (!modalExporting) { setModalExportTargets([tab]); setModalExportOpen(p=>!p); } }} disabled={modalExporting}>
                             {modalExporting ? "Exporting…" : "Export"}
                             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="6 9 12 15 18 9"/></svg>
                         </button>
@@ -1613,26 +2387,32 @@ function FloatingModal({
                                 <div className="txn-export-scope-label">Export Section</div>
                                 <div className="txn-export-scope-grid">
                                     {[
-                                        { key: "tab", label: `Current (${activeTabLabel})` },
-                                        { key: "header", label: "Header" },
-                                        { key: "body", label: "Body" },
-                                        { key: "rawcopies", label: "Raw Copies" },
-                                        { key: "payload", label: "FIN Payload" },
-                                        { key: "details", label: "All Fields" },
+                                    { key: "header", label: "Header" },
+                                    { key: "rawpayload", label: "Raw Payload" },
+                                    { key: "payload", label: "Extended text" },
                                         { key: "history", label: "History" },
-                                        { key: "all", label: "All Components" },
-                                    ].map(target => (
-                                        <button key={target.key} className={`txn-export-scope-btn${modalExportTarget===target.key?" active":""}`} onClick={()=>setModalExportTarget(target.key)}>
-                                            {target.label}
+                                    { key: "details", label: "All Fields" },
+                                    ].map(target => {
+                                        const order = orderedModalExportTargets.indexOf(target.key) + 1;
+                                        return (
+                                        <button key={target.key} className={`txn-export-scope-btn${order?" active":""}`} onClick={()=>toggleModalExportTarget(target.key)}>
+                                            <span>{target.label}</span>
+                                            {order ? <span className="txn-export-order-badge">{order}</span> : null}
                                         </button>
-                                    ))}
+                                    );})}
                                 </div>
                                 <div className="txn-export-format-label">Format</div>
                                 <div className="txn-export-format-grid">
-                                    {[
-                                        ["csv","CSV"],["excel","XLSX"],["json","JSON"],["pdf","PDF"],["word","WORD"],["xml","XML"],["txt","TXT"]
-                                    ].map(([key, label]) => (
-                                        <button key={key} className="txn-export-opt" onClick={()=>exportModalData(modalExportTarget, key)}>{label}</button>
+                                    {modalExportFormats.map((option) => (
+                                        <button
+                                            key={option.key}
+                                            className="txn-export-opt"
+                                            onClick={()=>exportModalData(orderedModalExportTargets, option.key)}
+                                            disabled={option.disabled}
+                                            title={option.disabledReason || undefined}
+                                        >
+                                            {option.iconText}
+                                        </button>
                                     ))}
                                 </div>
                             </div>
@@ -1644,7 +2424,7 @@ function FloatingModal({
                 </div>
             </div>
 
-            <div className="txn-summary-strip">
+            {false && <div className="txn-summary-strip">
                 <div className="txn-summary-item"><span className="txn-sum-label">Sender</span><span className="txn-sum-value mono">{msg.sender||"—"}</span></div>
                 <div className="txn-summary-arrow"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></div>
                 <div className="txn-summary-item"><span className="txn-sum-label">Receiver</span><span className="txn-sum-value mono">{msg.receiver||"—"}</span></div>
@@ -1655,7 +2435,33 @@ function FloatingModal({
                 <div className="txn-summary-divider"/>
                 <div className="txn-summary-item"><span className="txn-sum-label">Network</span><span className="txn-sum-value">{msg.networkProtocol||msg.network||"—"}</span></div>
                 <div className="txn-summary-item"><span className="txn-sum-label">Direction</span><span className={"dir-badge "+dirClass(msg.io||msg.direction)}>{formatDirection(msg.io||msg.direction)}</span></div>
-            </div>
+            </div>}
+
+            {(()=>{
+                const headerPairs = getHeaderPairs(msg);
+                const headerRows = [];
+                for (let i = 0; i < headerPairs.length; i += 2) {
+                    headerRows.push(headerPairs.slice(i, i + 2));
+                }
+                return (
+                    <div className="txn-fixed-header txn-section-wrap">
+                        <div className="txn-fixed-header-title">Header</div>
+                        <div className="txn-fixed-header-card">
+                            {headerRows.map((row,rowIdx)=>(
+                                <div key={`hdr-fixed-row-${rowIdx}`} className="txn-fixed-header-row" style={{borderBottom:rowIdx<headerRows.length-1?"1px solid var(--gray-6)":"none"}}>
+                                    {row.map((item,colIdx)=>(
+                                        <div key={item.key || item.label} className="txn-fixed-header-cell" style={{borderRight:colIdx===0&&row.length>1?"1px solid var(--gray-6)":"none"}}>
+                                            <div className="txn-fixed-header-label">{item.label}:</div>
+                                            <div style={{padding:"11px 16px",fontSize:14,fontWeight:600,color:"var(--black)",fontFamily:/reference|type/i.test(item.key||"")?"var(--font-mono)":"inherit",wordBreak:"break-all",display:"flex",alignItems:"center"}}>{stringifyExportValue(item.val)||"â€”"}</div>
+                                        </div>
+                                    ))}
+                                    {row.length===1&&<div />}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                );
+            })()}
 
             <div className="txn-tabs">
                 {modalTabs.map(t=>(
@@ -1670,61 +2476,28 @@ function FloatingModal({
             </div>
 
             <div className="txn-body fm-body" style={{height:bodyH,overflowY:"auto",overflowX:"hidden"}}>
-                {tab==="header"&&<div className="txn-section-wrap">
-                    <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:12}}>
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--gray-3)" strokeWidth="2" strokeLinecap="round"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
-                        <span style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:"var(--gray-3)"}}>Parties</span>
-                    </div>
-                    <div style={{display:"grid",gridTemplateColumns:"1fr 40px 1fr",alignItems:"stretch",marginBottom:24,border:"1px solid var(--gray-6)",borderRadius:8,overflow:"hidden"}}>
-                        <div style={{padding:"16px 18px",background:"var(--white)"}}>
-                            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
-                                <span style={{width:8,height:8,borderRadius:"50%",background:"#3b82f6",display:"inline-block",flexShrink:0}}/>
-                                <span style={{fontSize:10,fontWeight:700,letterSpacing:"0.07em",textTransform:"uppercase",color:"var(--gray-3)"}}>Sender</span>
-                            </div>
-                            <div style={{fontSize:16,fontWeight:700,color:"var(--black)",fontFamily:"var(--mono)",letterSpacing:"0.02em",marginBottom:4}}>{msg.sender||"—"}</div>
-                            <div style={{fontSize:13,color:"var(--gray-2)",marginBottom:4}}>{msg.rawMessage?.senderInstitutionName||""}</div>
-                            <div style={{fontSize:11,color:"var(--gray-4)"}}>Financial Institution</div>
+                {false&&tab==="header"&&(()=>{
+                    const headerPairs = getHeaderPairs(msg);
+                    const headerRows = [];
+                    for (let i = 0; i < headerPairs.length; i += 2) {
+                        headerRows.push(headerPairs.slice(i, i + 2));
+                    }
+                    return <div className="txn-section-wrap">
+                        <div style={{border:"1px solid var(--gray-6)",borderRadius:8,overflow:"hidden",background:"var(--white)"}}>
+                            {headerRows.map((row,rowIdx)=>(
+                                <div key={`hdr-row-${rowIdx}`} style={{display:"grid",gridTemplateColumns:"1fr 1fr",borderBottom:rowIdx<headerRows.length-1?"1px solid var(--gray-6)":"none",background:rowIdx%2===0?"var(--white)":"var(--gray-7)"}}>
+                                    {row.map((item,colIdx)=>(
+                                        <div key={item.key || item.label} style={{display:"grid",gridTemplateColumns:"160px 1fr",borderRight:colIdx===0&&row.length>1?"1px solid var(--gray-6)":"none"}}>
+                                            <div style={{padding:"11px 16px",fontSize:13,color:"var(--gray-2)",display:"flex",alignItems:"center"}}>{item.label}:</div>
+                                            <div style={{padding:"11px 16px",fontSize:14,fontWeight:600,color:"var(--black)",fontFamily:/reference|type/i.test(item.key||"")?"var(--font-mono)":"inherit",wordBreak:"break-all",display:"flex",alignItems:"center"}}>{stringifyExportValue(item.val)||"—"}</div>
+                                        </div>
+                                    ))}
+                                    {row.length===1&&<div />}
+                                </div>
+                            ))}
                         </div>
-                        <div style={{display:"flex",alignItems:"center",justifyContent:"center",borderLeft:"1px solid var(--gray-6)",borderRight:"1px solid var(--gray-6)",background:"var(--gray-7)"}}>
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--gray-4)" strokeWidth="1.8" strokeLinecap="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="13 6 19 12 13 18"/></svg>
-                        </div>
-                        <div style={{padding:"16px 18px",background:"var(--white)"}}>
-                            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:8}}>
-                                <span style={{width:8,height:8,borderRadius:"50%",background:"#22c55e",display:"inline-block",flexShrink:0}}/>
-                                <span style={{fontSize:10,fontWeight:700,letterSpacing:"0.07em",textTransform:"uppercase",color:"var(--gray-3)"}}>Receiver</span>
-                            </div>
-                            <div style={{fontSize:16,fontWeight:700,color:"var(--black)",fontFamily:"var(--mono)",letterSpacing:"0.02em",marginBottom:4}}>{msg.receiver||"—"}</div>
-                            <div style={{fontSize:13,color:"var(--gray-2)",marginBottom:4}}>{msg.rawMessage?.receiverInstitutionName||""}</div>
-                            <div style={{fontSize:11,color:"var(--gray-4)"}}>Financial Institution</div>
-                        </div>
-                    </div>
-                    <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:12}}>
-                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--gray-3)" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg>
-                        <span style={{fontSize:11,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:"var(--gray-3)"}}>Message Details</span>
-                    </div>
-                    <div style={{border:"1px solid var(--gray-6)",borderRadius:8,overflow:"hidden"}}>
-                        {[
-                            ["MESSAGE CODE",          msg.messageCode||getDisplayType(msg),                false],
-                            ["MESSAGE FORMAT",        msg.rawMessage?.messageFormat||getDisplayFormat(msg),false],
-                            ["REFERENCE",             msg.reference,                                       true],
-                            ["TRANSACTION REFERENCE", msg.transactionReference,                            true],
-                            ["TRANSFER REFERENCE",    msg.transferReference,                               true],
-                            ["MUR",                   msg.mur||msg.userReference,                         true],
-                            ["CREATION DATE",         msg.creationDate||msg.date,                         true],
-                            ["RECEIVED",              msg.receivedDT,                                      true],
-                            ["REMITTANCE",            msg.remittanceInfo,                                  false],
-                            ["UETR",                  msg.uetr,                                            true],
-                            ["WORKFLOW",              msg.workflow,                                        false],
-                            ["ENVIRONMENT",           msg.environment,                                     false],
-                            ["STATUS MESSAGE",        msg.statusMessage,                                   false],
-                        ].filter(([,v])=>v).map(([label,val,mono],i)=>(
-                            <div key={label} style={{display:"grid",gridTemplateColumns:"200px 1fr",borderBottom:i<12?"1px solid var(--gray-6)":"none",background:i%2===0?"var(--white)":"var(--gray-7)"}}>
-                                <div style={{padding:"11px 16px",fontSize:11,fontWeight:700,letterSpacing:"0.07em",textTransform:"uppercase",color:"var(--gray-3)",borderRight:"1px solid var(--gray-6)",display:"flex",alignItems:"center"}}>{label}</div>
-                                <div style={{padding:"11px 16px",fontSize:13,color:"var(--black)",fontFamily:mono?"monospace":"inherit",wordBreak:"break-all",display:"flex",alignItems:"center"}}>{val||"—"}</div>
-                            </div>
-                        ))}
-                    </div>
-                </div>}
+                    </div>;
+                })()}
 
                 {tab==="body"&&<div className="txn-section-wrap"><div className="txn-fields-grid">
                     <div className="txn-field"><span className="txn-field-label">Message Code</span><span className="txn-field-value">{msg.messageCode||getDisplayType(msg)||"—"}</span></div>
@@ -1747,6 +2520,7 @@ function FloatingModal({
 
                 {tab==="history"&&<div className="txn-section-wrap">
                     {(()=>{
+                        if(showDetailLoading) return <div className="adv-empty-state"><span className="spinner" style={{width:24,height:24,borderWidth:3,borderTopColor:"var(--accent)"}}/><p>Loading history...</p></div>;
                         const lines = msg.historyLines || msg.rawMessage?.historyLines || [];
                         if(lines.length===0) return <div className="adv-empty-state"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--gray-4)" strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><p>No history lines available</p></div>;
                         return (
@@ -1754,29 +2528,23 @@ function FloatingModal({
                                 <table className="history-table" style={{width:"max-content",minWidth:"100%",borderCollapse:"collapse",fontSize:13,tableLayout:"auto"}}>
                                     <thead style={{position:"sticky",top:0,zIndex:10}}>
                                         <tr style={{background:"var(--gray-7)",borderBottom:"2px solid var(--gray-5)"}}>
-                                            <th style={{padding:"12px 16px",textAlign:"center",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:40}}>#</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:180}}>Date & Time</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:110}}>Phase</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:110}}>Action</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:100}}>Reason</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:130}}>Entity</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:120}}>Channel</th>
-                                            <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:120}}>User</th>
-                                            <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:280}}>Comment</th>
                                         </tr>
                                     </thead>
                                     <tbody>
                                         {lines.map((line,idx)=>(
                                             <tr key={idx} style={{borderBottom:"1px solid var(--gray-6)",background:idx%2===0?"var(--white)":"var(--gray-7)"}}>
-                                                <td style={{padding:"10px 16px",color:"var(--gray-2)",fontWeight:600,textAlign:"center"}}>{line.index||idx+1}</td>
                                                 <td style={{padding:"10px 16px",fontFamily:"monospace",fontSize:12,color:"var(--black-3)",whiteSpace:"nowrap"}}>{line.historyDate?new Date(line.historyDate).toLocaleString("en-US",{year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:true}):"—"}</td>
                                                 <td style={{padding:"10px 16px",whiteSpace:"nowrap"}}>{line.phase?<span className="txn-status-badge" style={{fontSize:11,padding:"3px 9px"}}>{line.phase}</span>:"—"}</td>
                                                 <td style={{padding:"10px 16px",whiteSpace:"nowrap"}}>{line.action?<span className={"txn-status-badge "+(line.action==="Delivered"?"badge-ok":line.action==="Rejected"?"badge-bypass":"badge-pending")} style={{fontSize:11,padding:"3px 9px"}}>{line.action}</span>:"—"}</td>
                                                 <td style={{padding:"10px 16px",color:"var(--black-3)",whiteSpace:"nowrap"}}>{line.reason||"—"}</td>
                                                 <td style={{padding:"10px 16px",whiteSpace:"nowrap"}}>{line.entity?<span className="txn-status-badge" style={{fontSize:11,padding:"3px 9px",background:"var(--accent-light)",color:"var(--accent)"}}>{line.entity}</span>:"—"}</td>
                                                 <td style={{padding:"10px 16px",fontFamily:"monospace",fontSize:12,color:"var(--black-3)",whiteSpace:"nowrap"}}>{line.channel||"—"}</td>
-                                                <td style={{padding:"10px 16px",color:"var(--black-3)",whiteSpace:"nowrap"}}>{line.user||"—"}</td>
-                                                <td style={{padding:"10px 16px",color:"var(--black-3)",maxWidth:320,wordBreak:"break-word"}}>{line.comment||"—"}</td>
                                             </tr>
                                         ))}
                                     </tbody>
@@ -1786,32 +2554,30 @@ function FloatingModal({
                     })()}
                 </div>}
 
-                {tab==="payload"&&<div className="txn-section-wrap">
+                {tab==="payload"&&<div className="txn-section-wrap txn-payload-wrap">
                     {(()=>{
+                        if(showDetailLoading) return <div className="adv-empty-state"><span className="spinner" style={{width:24,height:24,borderWidth:3,borderTopColor:"var(--accent)"}}/><p>Loading Extended text...</p></div>;
                         const lines = msg.block4Fields || msg.rawMessage?.mtPayload?.block4Fields || [];
-                        if(lines.length===0) return <div className="adv-empty-state"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--gray-4)" strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><p>No FIN payload fields available</p></div>;
+                        if(lines.length===0) return <div className="adv-empty-state"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--gray-4)" strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><p>No Extended text fields available</p></div>;
                         return (
                             <div style={{overflowX:"auto"}}>
                                 <table className="history-table" style={{width:"max-content",minWidth:"100%",borderCollapse:"collapse",fontSize:13,tableLayout:"auto"}}>
                                     <thead style={{position:"sticky",top:0,zIndex:10}}>
                                         <tr style={{background:"var(--gray-7)",borderBottom:"2px solid var(--gray-5)"}}>
-                                            <th style={{padding:"12px 16px",textAlign:"center",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:40}}>#</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:60}}>Tag</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:220}}>Field Label</th>
                                             <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:300}}>Raw Value</th>
-                                            <th style={{padding:"12px 16px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap",minWidth:280}}>Components</th>
                                         </tr>
                                     </thead>
                                     <tbody>
                                         {lines.map((line,idx)=>(
                                             <tr key={idx} style={{borderBottom:"1px solid var(--gray-6)",background:idx%2===0?"var(--white)":"var(--gray-7)"}}>
-                                                <td style={{padding:"10px 16px",color:"var(--gray-2)",fontWeight:600,textAlign:"center"}}>{idx+1}</td>
                                                 <td style={{padding:"10px 16px",whiteSpace:"nowrap"}}>
                                                     <span className="txn-status-badge" style={{fontSize:11,padding:"3px 8px",fontFamily:"monospace",letterSpacing:"0.04em"}}>{line.tag||"—"}</span>
                                                 </td>
-                                                <td style={{padding:"10px 16px",color:"var(--black-3)",whiteSpace:"nowrap"}}>{line.label||"—"}</td>
+                                                <td style={{padding:"10px 16px",color:"var(--black-3)",whiteSpace:"nowrap"}}>{line.label||(line.tag ? `Tag ${line.tag}` : "—")}</td>
                                                 <td style={{padding:"10px 16px",fontFamily:"monospace",fontSize:11,color:"var(--black-3)",whiteSpace:"pre-wrap",wordBreak:"break-all",maxWidth:320}}>{line.rawValue||"—"}</td>
-                                                <td style={{padding:"10px 16px",fontSize:11,color:"var(--gray-2)"}}>
+                                                {false && <td style={{padding:"10px 16px",fontSize:11,color:"var(--gray-2)"}}>
                                                     {line.components&&Object.keys(line.components).length>0
                                                         ?<div style={{display:"flex",flexDirection:"column",gap:2}}>
                                                             {Object.entries(line.components).map(([ck,cv])=>(
@@ -1823,7 +2589,7 @@ function FloatingModal({
                                                          </div>
                                                         :"—"
                                                     }
-                                                </td>
+                                                </td>}
                                             </tr>
                                         ))}
                                     </tbody>
@@ -1831,13 +2597,26 @@ function FloatingModal({
                             </div>
                         );
                     })()}
-                </div>}{tab==="details"&&<div className="txn-section-wrap">
+                </div>}
+
+                {tab==="rawpayload"&&<div className="txn-section-wrap">
                     {(()=>{
-                        const raw=msg.rawMessage||{};
-                        const ALL_FIELDS=[["id","ID"],["messageType","FORMAT"],["messageCode","TYPE"],["messageTypeDescription","DESCRIPTION"],["io","DIRECTION"],["status","STATUS"],["phase","PHASE"],["action","ACTION"],["reason","REASON"],["statusMessage","STATUS MESSAGE"],["statusChangeSource","STATUS SOURCE"],["statusDecision","STATUS DECISION"],["reference","MESSAGE REF"],["transactionReference","TXN REF"],["mur","MUR (TAG 20)"],["sender","SENDER"],["receiver","RECEIVER"],["senderInstitutionName","SENDER NAME"],["receiverInstitutionName","RECEIVER NAME"],["amount","AMOUNT"],["ccy","CURRENCY"],["valueDate","VALUE DATE"],["networkProtocol","PROTOCOL"],["networkChannel","NETWORK CHANNEL"],["networkPriority","NETWORK PRIORITY"],["deliveryMode","DELIVERY MODE"],["service","SERVICE"],["backendChannel","BACKEND CHANNEL"],["backendChannelProtocol","CHANNEL PROTOCOL"],["workflow","WORKFLOW"],["workflowModel","WORKFLOW MODEL"],["owner","OWNER"],["processingType","PROCESSING TYPE"],["processPriority","PROCESS PRIORITY"],["profileCode","PROFILE CODE"],["originatorApplication","ORIGINATOR APP"],["sessionNumber","SESSION NO"],["sequenceNumber","SEQUENCE NO"],["creationDate","CREATED"],["receivedDT","RECEIVED"],["statusDate","STATUS DATE"],["valueDate","VALUE DATE"],["bankOperationCode","BANK OP CODE"],["detailsOfCharges","CHARGES"],["remittanceInfo","REMITTANCE"],["applicationId","APP ID"],["serviceId","SERVICE ID"],["logicalTerminalAddress","LOGICAL TERMINAL"],["messagePriority","MSG PRIORITY"],["pdeIndication","PDE"],["bulkType","BULK TYPE"],["nrIndicator","NR IND"],["channelCode","CHANNEL CODE"]];
-                        const shown=new Set(),ordered=[];
-                        ALL_FIELDS.forEach(([k,label])=>{const val=raw[k]??msg[k];if(val!==undefined&&val!==null&&val!==""){ordered.push({key:k,label,val});shown.add(k);}});
-                        Object.entries(raw).forEach(([k,v])=>{if(!shown.has(k)&&k!=="mtPayload"&&k!=="block4Fields"&&k!=="rawFin"&&v!==undefined&&v!==null&&v!=="")ordered.push({key:k,label:k.toUpperCase(),val:v});});
+                        if(showDetailLoading) return <div className="adv-empty-state"><span className="spinner" style={{width:24,height:24,borderWidth:3,borderTopColor:"var(--accent)"}}/><p>Loading raw payload...</p></div>;
+                        const rawPayloadText = getRawPayloadText(msg);
+                        if(!rawPayloadText || rawPayloadText === "—") return <div className="adv-empty-state"><svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="var(--gray-4)" strokeWidth="1.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><p>No raw payload available</p></div>;
+                        return (
+                            <div className="txn-raw-payload-card">
+                                <div className="txn-raw-payload-head">Raw Payload</div>
+                                <pre className="txn-raw-payload-text">{rawPayloadText}</pre>
+                            </div>
+                        );
+                    })()}
+                </div>}
+
+                {tab==="details"&&<div className="txn-section-wrap">
+                    {(()=>{
+                        if(showDetailLoading) return <div className="adv-empty-state"><span className="spinner" style={{width:24,height:24,borderWidth:3,borderTopColor:"var(--accent)"}}/><p>Loading fields...</p></div>;
+                        const ordered = getDetailPairs(msg);
                         if(!ordered.length) return <div style={{padding:40,textAlign:"center",color:"var(--gray-3)"}}><p>No fields available</p></div>;
                         const monoKeys=new Set(["id","mur","uetr","reference","transactionReference","creationDate","receivedDT","statusDate","sessionNumber","sequenceNumber","logicalTerminalAddress","applicationId","serviceId","bankOperationCode"]);
                         const renderVal=(key,val)=>{
@@ -1888,8 +2667,7 @@ function FloatingModal({
                                     <thead>
                                         <tr style={{background:"var(--gray-7)",borderBottom:"2px solid var(--gray-5)"}}>
                                             <th style={{padding:"10px 14px",textAlign:"center",fontWeight:600,color:"var(--gray-2)",width:36}}/>
-                                            <th style={{padding:"10px 14px",textAlign:"center",fontWeight:600,color:"var(--gray-2)",width:36}}>#</th>
-                                            <th style={{padding:"10px 14px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap"}}>Message ID</th>
+                                            <th style={{padding:"10px 14px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap"}}>Message Reference</th>
                                             <th style={{padding:"10px 14px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap"}}>Type</th>
                                             <th style={{padding:"10px 14px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap"}}>Direction</th>
                                             <th style={{padding:"10px 14px",textAlign:"left",fontWeight:600,color:"var(--gray-2)",whiteSpace:"nowrap"}}>Status</th>
@@ -1901,7 +2679,7 @@ function FloatingModal({
                                     </thead>
                                     <tbody>
                                         {(modalRcData.copies||[]).length === 0 ? (
-                                            <tr><td colSpan={10} style={{padding:32,textAlign:"center",color:"var(--gray-3)",fontStyle:"italic"}}>No raw copies found for this reference</td></tr>
+                                            <tr><td colSpan={9} style={{padding:32,textAlign:"center",color:"var(--gray-3)",fontStyle:"italic"}}>No raw copies found for this reference</td></tr>
                                         ) : (modalRcData.copies||[]).map((row, ri) => (
                                             <React.Fragment key={row.id||ri}>
                                                 <tr onClick={()=>setModalRcExpanded(p=>p===row.id?null:row.id)}
@@ -1912,8 +2690,7 @@ function FloatingModal({
                                                             <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="9 18 15 12 9 6"/></svg>
                                                         </button>
                                                     </td>
-                                                    <td style={{padding:"8px 14px",color:"var(--gray-3)",fontWeight:600,fontSize:12,textAlign:"center"}}>{ri+1}</td>
-                                                    <td style={{padding:"8px 14px",fontFamily:"monospace",fontSize:11,color:"var(--black-3)"}}>{row.messageId?row.messageId.slice(0,22)+(row.messageId.length>22?"…":""):"—"}</td>
+                                                    <td style={{padding:"8px 14px",fontFamily:"monospace",fontSize:11,color:"var(--black-3)"}}>{row.messageReference?row.messageReference.slice(0,22)+(row.messageReference.length>22?"…":""):"—"}</td>
                                                     <td style={{padding:"8px 14px"}}><span style={{fontFamily:"monospace",fontWeight:700,fontSize:12}}>{row.messageTypeCode||"—"}</span></td>
                                                     <td style={{padding:"8px 14px"}}><span className={rcDirCls(row.direction)}>{row.direction||"—"}</span></td>
                                                     <td style={{padding:"8px 14px"}}><span className={rcStatusCls(row.currentStatus)}>{row.currentStatus||"—"}</span></td>
@@ -1924,7 +2701,7 @@ function FloatingModal({
                                                 </tr>
                                                 {modalRcExpanded===row.id&&(
                                                     <tr style={{background:"#f8fafc"}}>
-                                                        <td colSpan={10} style={{padding:0}}>
+                                                        <td colSpan={9} style={{padding:0}}>
                                                             <div style={{padding:"14px 18px",borderTop:"1px solid var(--gray-5)"}}>
                                                                 <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8}}>
                                                                     <div>
@@ -2006,7 +2783,7 @@ function Search() {
     const [highlightText,   setHighlightText]   = useState("");
     const [showExportMenu,  setShowExportMenu]  = useState(false);
     const [exportScope,     setExportScope]     = useState("all");
-    const [exportTarget,    setExportTarget]    = useState("table");
+    const [exportTargets,   setExportTargets]   = useState(["table"]);
     const [toastMsg,        setToastMsg]        = useState(null);
     const [openModals,      setOpenModals]      = useState([]);
     const openModalsRef = useRef([]);   // always-current mirror — no stale closure
@@ -2189,12 +2966,13 @@ function Search() {
     },[searchState.format, opts]);
 
     const activeFieldDefs = useMemo(()=>{
+        const visible = (fields) => fields.filter(f => !ADV_HIDDEN_GROUPS.has(f.group));
         if (dynFieldsLoaded && dynamicFields.length > 0) {
             const dynKeys = new Set(dynamicFields.map(f=>f.key));
             const staticOnly = FIELD_DEFINITIONS.filter(f=>!dynKeys.has(f.key));
-            return [...dynamicFields, ...staticOnly];
+            return visible([...dynamicFields, ...staticOnly]);
         }
-        return FIELD_DEFINITIONS;
+        return visible(FIELD_DEFINITIONS);
     }, [dynFieldsLoaded, dynamicFields]);
 
     // Close dropdowns on outside click
@@ -2262,14 +3040,19 @@ function Search() {
         selectedDefs.forEach(def => def.colKeys.forEach(ck=>colKeySet.add(ck)));
         const extraCols = getDynamicExtraColumns(selectedDefs);
         const staticFiltered = COLUMNS.filter(c=>colKeySet.has(c.key));
-        return [...staticFiltered, ...extraCols.filter(c=>!staticFiltered.find(s=>s.key===c.key))];
-    },[searchMode, advancedFields, activeFieldDefs]);
+        const derivedCols = buildAdvancedDerivedColumns(selectedDefs, result);
+        return [
+            ...staticFiltered,
+            ...extraCols.filter(c=>!staticFiltered.find(s=>s.key===c.key)),
+            ...derivedCols.filter(c=>!staticFiltered.find(s=>s.key===c.key) && !extraCols.find(e=>e.key===c.key)),
+        ];
+    },[searchMode, advancedFields, activeFieldDefs, result]);
 
     const handleClear=()=>{
         setSearchState(initialSearchState); setResult([]); setShowResult(false);
         setCurrentPage(1); setStartPage(1); setColFilters({}); setActiveCol(null);
         setGoToPage(""); setSortKey(null); setSortDir(SORT_NONE);
-        setSelectedRows(new Set()); setHighlightText(""); setExportScope("all");
+        setSelectedRows(new Set()); setHighlightText(""); setExportScope("all"); setExportTargets(["table"]);
         setServerTotal(0); setServerTotalPages(0);
         if (searchMode==="advanced") setAdvancedFields(["dateRange"]);
     };
@@ -2318,6 +3101,7 @@ function Search() {
         if(s.workflow)             params.set("workflow",              s.workflow);
         if(s.workflowModel)        params.set("workflowModel",         s.workflowModel);
         if(s.originatorApplication)params.set("originatorApplication", s.originatorApplication);
+        if(s.sourceSystem)         params.set("sourceSystem",          s.sourceSystem);
         if(s.phase)                params.set("phase",                 s.phase);
         if(s.action)               params.set("action",                s.action);
         if(s.reason)               params.set("reason",                s.reason);
@@ -2330,6 +3114,8 @@ function Search() {
         if(s.amlDetails)           params.set("amlDetails",            s.amlDetails);
         if(s.seqFrom && !isNaN(parseInt(s.seqFrom,10))) params.set("seqFrom", parseInt(s.seqFrom,10));
         if(s.seqTo   && !isNaN(parseInt(s.seqTo,  10))) params.set("seqTo",   parseInt(s.seqTo,  10));
+        if(s.sessionNumber)        params.set("sessionNumber",         s.sessionNumber);
+        if(s.logicalTerminalAddress) params.set("logicalTerminalAddress", s.logicalTerminalAddress);
         if(s.startDate)            params.set("startDate",             d(s.startDate));
         if(s.endDate)              params.set("endDate",               d(s.endDate));
         if(s.valueDateFrom)        params.set("valueDateFrom",         d(s.valueDateFrom));
@@ -2344,18 +3130,49 @@ function Search() {
         if(s.historyAction)        params.set("historyAction",         s.historyAction);
         if(s.historyUser)          params.set("historyUser",           s.historyUser);
         if(s.historyChannel)       params.set("historyChannel",        s.historyChannel);
-        if(s.block4Value)          params.set("block4Value",           s.block4Value);
         if(s.freeSearchText)       params.set("freeSearchText",        s.freeSearchText);
+
+        const handledBackendParams = new Set([
+            "messageType", "messageCode", "io", "status", "messagePriority", "copyIndicator",
+            "finCopyService", "possibleDuplicate", "sender", "receiver", "correspondent",
+            "reference", "transactionReference", "transferReference", "relatedReference", "mur",
+            "uetr", "mxInputReference", "mxOutputReference", "networkReference", "e2eMessageId",
+            "ccy", "amountFrom", "amountTo", "networkProtocol", "networkChannel", "networkPriority",
+            "deliveryMode", "service", "country", "originCountry", "destinationCountry", "owner",
+            "workflow", "workflowModel", "originatorApplication", "sourceSystem", "phase", "action",
+            "reason", "processingType", "processPriority", "profileCode", "environment", "nack",
+            "amlStatus", "amlDetails", "seqFrom", "seqTo", "sessionNumber", "startDate", "endDate", "valueDateFrom",
+            "valueDateTo", "statusDateFrom", "statusDateTo", "receivedDateFrom", "receivedDateTo",
+            "historyEntity", "historyDescription", "historyPhase", "historyAction", "historyUser",
+            "historyChannel", "freeSearchText",
+        ]);
+
+        activeFieldDefs.forEach(def => {
+            const backendParam = def.backendParam;
+            const stateKeys = def.stateKeys || [def.key];
+            if (!backendParam || handledBackendParams.has(backendParam) || backendParam.includes(",") || stateKeys.length !== 1) {
+                return;
+            }
+            if (def.type === "date-range" || def.type === "date-range2" || def.type === "amount-range" || def.type === "seq-range") {
+                return;
+            }
+            const value = s[stateKeys[0]];
+            if (value !== undefined && value !== null && value !== "") {
+                params.set(backendParam, value);
+            }
+        });
+
         params.set("page", page);
         params.set("size", size);
         return params;
-    }, []);
+    }, [activeFieldDefs]);
 
     // ── Execute SWIFT message search ──────────────────────────────────────────
-    const handleSearch=(pageOverride)=>{
+    const handleSearch=(pageOverride, sizeOverride)=>{
         setIsSearching(true); setIsFetching(true); setFetchError(null);
         const page = (pageOverride !== undefined) ? pageOverride : 0;
-        const params = buildParams(searchState, page, recordsPerPage);
+        const size = sizeOverride ?? recordsPerPage;
+        const params = buildParams(searchState, page, size);
         fetch(`${API_BASE_URL}?${params.toString()}`, { headers: authHeaders() })
             .then(r=>{ if(!r.ok) throw new Error(`Search failed (${r.status})`); return r.json(); })
             .then(data=>{
@@ -2368,7 +3185,7 @@ function Search() {
                 setHighlightText(searchState.freeSearchText||"");
                 setShowResult(true); setColFilters({}); setActiveCol(null); setGoToPage("");
                 setSortKey(null); setSortDir(SORT_NONE);
-                setSelectedRows(new Set()); setExportScope("all");
+                setSelectedRows(new Set()); setExportScope("all"); setExportTargets(["table"]);
                 setIsSearching(false); setIsFetching(false);
                 const total = data.totalElements || rows.length;
                 showToast(`Found ${total} message${total!==1?"s":""}`, "info");
@@ -2514,7 +3331,7 @@ function Search() {
         setColWidths(prev => { const n = {...prev}; delete n[colKey]; return n; });
     }, []);
 
-    const ALWAYS_VISIBLE_COLS = new Set(["sequenceNumber","format","type","date","time"]);
+    const ALWAYS_VISIBLE_COLS = new Set(["sequenceNumber","sessionNumber","format","type","date","time"]);
 
     const allColumns = useMemo(()=>{
         if (searchMode === "fixed") return FIXED_TABLE_COLUMNS;
@@ -2581,16 +3398,44 @@ function Search() {
     }, [authHeaders, buildParams, searchState]);
 
     const fetchAllRows = useCallback(async () => {
-        const firstPage = await fetchSearchPage(0, serverTotal > 0 ? serverTotal : 10000);
-        if (firstPage.totalPages <= 1) return firstPage.rows;
+        const params = buildParams(searchState, 0, recordsPerPage);
+        params.delete("page");
+        params.delete("size");
+        const res = await fetch(`${API_EXPORT_ALL_URL}?${params.toString()}`, { headers: authHeaders() });
+        if (!res.ok) throw new Error(`Export fetch failed (${res.status})`);
+        const data = await res.json();
+        return Array.isArray(data) ? data : (Array.isArray(data?.content) ? data.content : []);
+    }, [authHeaders, buildParams, searchState, recordsPerPage]);
 
-        const allRows = [...firstPage.rows];
-        for (let page = 1; page < firstPage.totalPages; page += 1) {
-            const pageData = await fetchSearchPage(page, firstPage.pageSize);
-            allRows.push(...pageData.rows);
+    const fetchMessageDetailsByReferences = useCallback(async (references) => {
+        const uniqueRefs = [...new Set((references || []).filter(Boolean))];
+        if (uniqueRefs.length === 0) return new Map();
+        const res = await fetch(API_DETAILS_BY_REFS_URL, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify(uniqueRefs),
+        });
+        if (!res.ok) throw new Error(`Detail fetch failed (${res.status})`);
+        const data = await res.json();
+        const rows = Array.isArray(data) ? data : [];
+        return new Map(rows.map(row => [row.reference || row.messageReference, row]));
+    }, [authHeaders]);
+
+    const ensureDetailedMessages = useCallback(async (messages, targetKeys) => {
+        const orderedKeys = Array.isArray(targetKeys) && targetKeys.length ? targetKeys : ["table"];
+        if (orderedKeys.length === 1 && orderedKeys[0] === "table") {
+            return messages || [];
         }
-        return allRows;
-    }, [fetchSearchPage, serverTotal]);
+        const refsNeedingDetail = (messages || [])
+            .filter(msg => !(msg.rawMessage || msg.block4Fields || msg.historyLines))
+            .map(msg => msg.reference || msg.messageReference)
+            .filter(Boolean);
+        if (refsNeedingDetail.length === 0) {
+            return messages || [];
+        }
+        const detailMap = await fetchMessageDetailsByReferences(refsNeedingDetail);
+        return (messages || []).map(msg => detailMap.get(msg.reference || msg.messageReference) || msg);
+    }, [fetchMessageDetailsByReferences]);
 
     const getExportRows = (scope) => {
         if (scope === "selected") return processed.filter(m => selectedRows.has(getMsgId(m)));
@@ -2650,27 +3495,11 @@ function Search() {
         const raw = msg.rawMessage || {};
 
         if (sectionKey === "header") {
-            const pairs = [
-                ["Message Code", msg.messageCode || getDisplayType(msg)],
-                ["Message Format", raw.messageFormat || getDisplayFormat(msg)],
-                ["Reference", msg.reference],
-                ["Transaction Reference", msg.transactionReference],
-                ["Transfer Reference", msg.transferReference],
-                ["MUR", msg.mur || msg.userReference],
-                ["Creation Date", msg.creationDate || msg.date],
-                ["Received", msg.receivedDT],
-                ["Remittance", msg.remittanceInfo],
-                ["UETR", msg.uetr],
-                ["Workflow", msg.workflow],
-                ["Environment", msg.environment],
-                ["Status Message", msg.statusMessage],
-                ["Sender", msg.sender],
-                ["Receiver", msg.receiver],
-            ].filter(([, v]) => v !== undefined && v !== null && v !== "");
+            const pairs = getHeaderExportPairs(msg);
             return {
                 label: "Header",
                 columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
-                rows: pairs.map(([field, value]) => ({ field, value: stringifyExportValue(value) })),
+                rows: pairs.map(item => ({ field: item.label, value: stringifyExportValue(item.val) })),
             };
         }
 
@@ -2705,7 +3534,6 @@ function Search() {
             return {
                 label: "History",
                 columns: [
-                    { key: "index", label: "#" },
                     { key: "dateTime", label: "Date Time" },
                     { key: "phase", label: "Phase" },
                     { key: "action", label: "Action" },
@@ -2715,8 +3543,7 @@ function Search() {
                     { key: "user", label: "User" },
                     { key: "comment", label: "Comment" },
                 ],
-                rows: lines.map((line, idx) => ({
-                    index: line.index || idx + 1,
+                rows: lines.map((line) => ({
                     dateTime: line.historyDate ? new Date(line.historyDate).toLocaleString("en-US", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true }) : "—",
                     phase: line.phase || "—",
                     action: line.action || "—",
@@ -2732,40 +3559,30 @@ function Search() {
         if (sectionKey === "payload") {
             const lines = msg.block4Fields || raw.mtPayload?.block4Fields || [];
             return {
-                label: "FIN Payload",
+                label: "Extended text",
                 columns: [
-                    { key: "index", label: "#" },
                     { key: "tag", label: "Tag" },
                     { key: "label", label: "Field Label" },
                     { key: "rawValue", label: "Raw Value" },
-                    { key: "components", label: "Components" },
                 ],
-                rows: lines.map((line, idx) => ({
-                    index: idx + 1,
+                rows: lines.map((line) => ({
                     tag: line.tag || "—",
-                    label: line.label || "—",
+                    label: line.label || (line.tag ? `Tag ${line.tag}` : "—"),
                     rawValue: line.rawValue || "—",
-                    components: line.components && Object.keys(line.components).length > 0 ? JSON.stringify(line.components) : "—",
                 })),
             };
         }
 
+        if (sectionKey === "rawpayload") {
+            return {
+                label: "Raw Payload",
+                columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
+                rows: [{ field: "Raw Payload", value: stringifyExportValue(getRawPayloadText(msg)) }],
+            };
+        }
+
         if (sectionKey === "details") {
-            const ALL_FIELDS = [["id","ID"],["messageType","FORMAT"],["messageCode","TYPE"],["messageTypeDescription","DESCRIPTION"],["io","DIRECTION"],["status","STATUS"],["phase","PHASE"],["action","ACTION"],["reason","REASON"],["statusMessage","STATUS MESSAGE"],["statusChangeSource","STATUS SOURCE"],["statusDecision","STATUS DECISION"],["reference","MESSAGE REF"],["transactionReference","TXN REF"],["mur","MUR (TAG 20)"],["sender","SENDER"],["receiver","RECEIVER"],["senderInstitutionName","SENDER NAME"],["receiverInstitutionName","RECEIVER NAME"],["amount","AMOUNT"],["ccy","CURRENCY"],["valueDate","VALUE DATE"],["networkProtocol","PROTOCOL"],["networkChannel","NETWORK CHANNEL"],["networkPriority","NETWORK PRIORITY"],["deliveryMode","DELIVERY MODE"],["service","SERVICE"],["backendChannel","BACKEND CHANNEL"],["backendChannelProtocol","CHANNEL PROTOCOL"],["workflow","WORKFLOW"],["workflowModel","WORKFLOW MODEL"],["owner","OWNER"],["processingType","PROCESSING TYPE"],["processPriority","PROCESS PRIORITY"],["profileCode","PROFILE CODE"],["originatorApplication","ORIGINATOR APP"],["sessionNumber","SESSION NO"],["sequenceNumber","SEQUENCE NO"],["creationDate","CREATED"],["receivedDT","RECEIVED"],["statusDate","STATUS DATE"],["valueDate","VALUE DATE"],["bankOperationCode","BANK OP CODE"],["detailsOfCharges","CHARGES"],["remittanceInfo","REMITTANCE"],["applicationId","APP ID"],["serviceId","SERVICE ID"],["logicalTerminalAddress","LOGICAL TERMINAL"],["messagePriority","MSG PRIORITY"],["pdeIndication","PDE"],["bulkType","BULK TYPE"],["nrIndicator","NR IND"],["channelCode","CHANNEL CODE"]];
-            const shown = new Set();
-            const ordered = [];
-            ALL_FIELDS.forEach(([k, label]) => {
-                const val = raw[k] ?? msg[k];
-                if (val !== undefined && val !== null && val !== "") {
-                    ordered.push({ label, val });
-                    shown.add(k);
-                }
-            });
-            Object.entries(raw).forEach(([k, v]) => {
-                if (!shown.has(k) && k !== "mtPayload" && k !== "block4Fields" && k !== "rawFin" && v !== undefined && v !== null && v !== "") {
-                    ordered.push({ label: k.toUpperCase(), val: v });
-                }
-            });
+            const ordered = getDetailPairs(msg);
             return {
                 label: "All Fields",
                 columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
@@ -2777,8 +3594,7 @@ function Search() {
             return {
                 label: "Raw Copies",
                 columns: [
-                    { key: "index", label: "#" },
-                    { key: "messageId", label: "Message ID" },
+                    { key: "messageReference", label: "Message Reference" },
                     { key: "messageTypeCode", label: "Type" },
                     { key: "direction", label: "Direction" },
                     { key: "currentStatus", label: "Status" },
@@ -2790,9 +3606,8 @@ function Search() {
                     { key: "source", label: "Source" },
                     { key: "rawInput", label: "Raw Input" },
                 ],
-                rows: (rawCopies || []).map((row, idx) => ({
-                    index: idx + 1,
-                    messageId: row.messageId || "—",
+                rows: (rawCopies || []).map((row) => ({
+                    messageReference: row.messageReference || "—",
                     messageTypeCode: row.messageTypeCode || "—",
                     direction: row.direction || "—",
                     currentStatus: row.currentStatus || "—",
@@ -2831,7 +3646,7 @@ function Search() {
             : baseColumns;
 
         if (sectionKey === "allcomponents") {
-            const blockKeys = ["header", "body", "history", "payload", "details", "rawcopies"];
+            const blockKeys = ["header", "history", "payload", "rawpayload", "details", "rawcopies"];
             const keySet = new Set(["messageReference", "reference", "messageType", "messageFormat", "sequenceNumber", "creationDate", "section"]);
             const rows = [];
 
@@ -2840,13 +3655,8 @@ function Search() {
                 const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
                 blockKeys.forEach(blockKey => {
                     const block = buildMessageSectionData(msg, blockKey, rcRows);
-                    const hasNativeIndex = block.columns?.some(col => col.key === "index" || col.label === "#");
-                    block.rows.forEach((row, idx) => {
+                    block.rows.forEach((row) => {
                         const merged = { ...meta, section: block.label };
-                        if (!hasNativeIndex) {
-                            merged.recordNo = idx + 1;
-                            keySet.add("recordNo");
-                        }
                         Object.entries(row).forEach(([key, value]) => {
                             merged[key] = value;
                             keySet.add(key);
@@ -2856,15 +3666,13 @@ function Search() {
                 });
             });
 
-            const columns = [...keySet].map(key => ({ key, label: key === "recordNo" ? "#" : toPrettyLabel(key) }));
+            const columns = [...keySet].map(key => ({ key, label: toPrettyLabel(key) }));
             return { label: "All Components", columns, rows };
         }
 
         const sampleBlock = buildMessageSectionData(messages[0] || {}, sectionKey, []);
-        const hasNativeIndex = sampleBlock.columns?.some(col => col.key === "index" || col.label === "#");
         const columns = [
             ...sectionBaseColumns,
-            ...(hasNativeIndex ? [] : [{ key: "recordNo", label: "#" }]),
             ...sampleBlock.columns,
         ];
         const rows = [];
@@ -2873,28 +3681,446 @@ function Search() {
             const meta = getExportMessageMeta(msg);
             const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
             const block = buildMessageSectionData(msg, sectionKey, rcRows);
-            block.rows.forEach((row, idx) => {
-                rows.push(hasNativeIndex ? { ...meta, ...row } : { ...meta, recordNo: idx + 1, ...row });
+            block.rows.forEach((row) => {
+                rows.push({ ...meta, ...row });
             });
         });
 
         return { label: sampleBlock.label, columns, rows };
     }, [buildMessageSectionData, buildResultTableDataset, fetchRawCopiesByRefs, getExportMessageMeta]);
 
-    const runExport = async (scope, targetKey, format) => {
+    const getExportTargetLabel = useCallback((targetKey) => (
+        MAIN_EXPORT_TARGETS.find(target => target.key === targetKey)?.label || toPrettyLabel(targetKey)
+    ), []);
+
+    const buildOrderedSectionDataset = useCallback(async (messages, targetKeys) => {
+        const orderedKeys = Array.isArray(targetKeys) && targetKeys.length ? targetKeys : ["table"];
+        if (orderedKeys.length === 1) return buildSectionDataset(messages, orderedKeys[0]);
+
+        const needsRawCopies = orderedKeys.includes("rawcopies");
+        const rawCopyMap = needsRawCopies
+            ? await fetchRawCopiesByRefs(messages.map(msg => msg.reference || msg.messageReference).filter(Boolean))
+            : new Map();
+
+        const preferredKeys = ["messageReference", "reference", "messageType", "messageFormat", "sequenceNumber", "creationDate", "section"];
+        const keySet = new Set(preferredKeys);
+        const rows = [];
+
+        messages.forEach((msg) => {
+            const meta = getExportMessageMeta(msg);
+            const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
+
+            orderedKeys.forEach((targetKey) => {
+                const block = targetKey === "table"
+                    ? buildResultTableDataset([msg])
+                    : buildMessageSectionData(msg, targetKey, rcRows);
+
+                block.rows.forEach((row) => {
+                    const merged = { ...meta, section: block.label };
+                    Object.entries(row).forEach(([key, value]) => {
+                        merged[key] = value;
+                        keySet.add(key);
+                    });
+                    rows.push(merged);
+                });
+            });
+        });
+
+        const orderedColumns = [
+            ...preferredKeys.filter(key => keySet.has(key)),
+            ...[...keySet].filter(key => !preferredKeys.includes(key)),
+        ];
+        const columns = orderedColumns.map(key => ({ key, label: toPrettyLabel(key) }));
+        const label = orderedKeys.map(getExportTargetLabel).join(" + ");
+        return { label, columns, rows };
+    }, [buildMessageSectionData, buildResultTableDataset, fetchRawCopiesByRefs, getExportMessageMeta, getExportTargetLabel]);
+
+    const buildOrderedSectionJson = useCallback(async (messages, targetKeys) => {
+        const orderedKeys = Array.isArray(targetKeys) && targetKeys.length ? targetKeys : ["table"];
+        const needsRawCopies = orderedKeys.includes("rawcopies");
+        const rawCopyMap = needsRawCopies
+            ? await fetchRawCopiesByRefs(messages.map(msg => msg.reference || msg.messageReference).filter(Boolean))
+            : new Map();
+
+        return messages.map((msg) => {
+            const meta = getExportMessageMeta(msg);
+            const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
+            return {
+                messageReference: meta.messageReference,
+                sections: orderedKeys.map((targetKey) => {
+                    const block = targetKey === "table"
+                        ? buildResultTableDataset([msg])
+                        : buildMessageSectionData(msg, targetKey, rcRows);
+                    return {
+                        section: getExportTargetLabel(targetKey),
+                        data: buildSectionJsonData({ targetKey, block, meta }),
+                    };
+                }),
+            };
+        });
+    }, [buildMessageSectionData, buildResultTableDataset, fetchRawCopiesByRefs, getExportMessageMeta, getExportTargetLabel]);
+
+    const exportOrderedSectionsWord = useCallback(async ({ messages, orderedKeys, fileBaseName, exportTitle }) => {
+        const needsRawCopies = orderedKeys.includes("rawcopies");
+        const rawCopyMap = needsRawCopies
+            ? await fetchRawCopiesByRefs(messages.map(msg => msg.reference || msg.messageReference).filter(Boolean))
+            : new Map();
+
+        const documents = messages.map((msg, msgIdx) => {
+            const meta = getExportMessageMeta(msg);
+            const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
+            const sections = orderedKeys.map((targetKey) => {
+                const block = targetKey === "table"
+                    ? buildResultTableDataset([msg])
+                    : buildMessageSectionData(msg, targetKey, rcRows);
+                const blockColumns = targetKey === "rawcopies"
+                    ? block.columns.filter((column) => !["senderAddress", "receiverAddress", "protocol", "receivedAt", "inputType", "source"].includes(column.key))
+                    : block.columns;
+                const isPairBlock = blockColumns.length === 2 && blockColumns.some(col => col.key === "field") && blockColumns.some(col => col.key === "value");
+
+                if (targetKey === "rawpayload") {
+                    return { label: block.label, type: "raw", rawText: stringifyExportValue(getRawPayloadText(msg) || "—") || "—" };
+                }
+
+                if (isPairBlock) {
+                    return {
+                        label: block.label,
+                        type: "pair",
+                        columns: blockColumns,
+                        rows: block.rows.map((row) => ({
+                            field: stringifyExportValue(row.field || "—") || "—",
+                            value: stringifyExportValue(row.value || "—") || "—",
+                        })),
+                    };
+                }
+
+                if (block.rows.length === 1 && blockColumns.length > 4) {
+                    const single = block.rows[0] || {};
+                    return {
+                        label: block.label,
+                        type: "pair",
+                        columns: [{ key: "field", label: "Field" }, { key: "value", label: "Value" }],
+                        rows: blockColumns.map((column) => ({
+                            field: column.label,
+                            value: stringifyExportValue(single[column.key] ?? "—") || "—",
+                        })),
+                    };
+                }
+
+                const safeColumns = getWordRenderableColumns(blockColumns, block.rows);
+                return {
+                    label: block.label,
+                    type: "table",
+                    columns: safeColumns,
+                    rows: (block.rows.length ? block.rows : [{}]).map((row) => Object.fromEntries(
+                        safeColumns.map((column) => [column.key, stringifyExportValue(row?.[column.key] ?? "—") || "—"])
+                    )),
+                };
+            });
+
+            return {
+                pageBreak: msgIdx > 0,
+                pageLabel: `Page ${msgIdx + 1}`,
+                messageRef: meta.messageReference || getReference(msg) || "—",
+                summaryLine: [meta.messageType, meta.messageFormat, formatDirection(msg.io || msg.direction)].filter(Boolean).join("   "),
+                sections,
+            };
+        });
+
+        const html = buildWordComponentExportHtml({
+            title: exportTitle,
+            documents,
+        });
+        triggerWordDownload(html, fileBaseName);
+    }, [buildMessageSectionData, buildResultTableDataset, fetchRawCopiesByRefs, formatDirection, getExportMessageMeta, getReference]);
+
+    const exportOrderedSectionsPdf = useCallback(async ({ messages, orderedKeys, fileBaseName, exportTitle }) => {
+        await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js", () => !!window.jspdf?.jsPDF);
+        await loadScriptOnce("https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js", () => !!window.jspdf?.jsPDF?.API?.autoTable);
+
+        const needsRawCopies = orderedKeys.includes("rawcopies");
+        const rawCopyMap = needsRawCopies
+            ? await fetchRawCopiesByRefs(messages.map(msg => msg.reference || msg.messageReference).filter(Boolean))
+            : new Map();
+
+        const { jsPDF } = window.jspdf;
+        const doc = new jsPDF({ orientation: "portrait", unit: "pt", format: "a4" });
+        const margin = { top: 48, right: 34, bottom: 34, left: 34 };
+        const pageWidth = doc.internal.pageSize.getWidth();
+        const pageHeight = doc.internal.pageSize.getHeight();
+        const contentWidth = pageWidth - margin.left - margin.right;
+        let cursorY = margin.top;
+
+        const drawPageHeader = () => {
+            doc.setFont("helvetica", "bold");
+            doc.setFont("helvetica", "normal");
+            doc.setFontSize(8);
+            doc.text(`Page ${doc.getNumberOfPages()}`, pageWidth - margin.right, 28, { align: "right" });
+        };
+
+        const resetPageCursor = () => {
+            cursorY = margin.top;
+            drawPageHeader();
+        };
+
+        const ensureSpace = (neededHeight) => {
+            if (cursorY + neededHeight <= pageHeight - margin.bottom) return;
+            doc.addPage();
+            resetPageCursor();
+        };
+
+        const drawSectionHeading = (label) => {
+            ensureSpace(20);
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(10);
+            doc.setTextColor(33, 56, 99);
+            doc.text(label, margin.left, cursorY);
+            cursorY += 8;
+        };
+
+        const drawPairTable = (pairs) => {
+            doc.autoTable({
+                startY: cursorY,
+                margin,
+                tableWidth: contentWidth,
+                theme: "grid",
+                head: [["Field", "Value"]],
+                body: pairs.length ? pairs : [["Field", "—"]],
+                styles: {
+                    fontSize: 8.25,
+                    cellPadding: { top: 4, right: 5, bottom: 4, left: 5 },
+                    overflow: "linebreak",
+                    valign: "top",
+                    lineColor: [226, 232, 240],
+                    lineWidth: 0.35,
+                },
+                headStyles: {
+                    fillColor: [243, 244, 246],
+                    textColor: [55, 65, 81],
+                    fontStyle: "bold",
+                    fontSize: 8.25,
+                },
+                columnStyles: {
+                    0: { cellWidth: 170, fontStyle: "bold", textColor: [100, 116, 139] },
+                    1: { cellWidth: contentWidth - 170, textColor: [17, 24, 39] },
+                },
+                didDrawPage: () => drawPageHeader(),
+            });
+            cursorY = (doc.lastAutoTable?.finalY || cursorY) + 12;
+        };
+
+        const pruneEmptyColumns = (columns, rows) => {
+            const alwaysKeep = new Set(["index"]);
+            return columns.filter((column) => {
+                if (alwaysKeep.has(column.key)) return true;
+                return rows.some((row) => {
+                    const value = stringifyExportValue(row?.[column.key]);
+                    return value && value !== "—";
+                });
+            });
+        };
+
+        const drawDataTable = (columns, rows) => {
+            const safeColumns = pruneEmptyColumns(columns, rows);
+            const widthSeed = estimatePdfColumnWidths(safeColumns, rows);
+            const totalWidth = widthSeed.reduce((sum, width) => sum + width, 0) || 1;
+            const scale = totalWidth > contentWidth ? contentWidth / totalWidth : 1;
+            const scaledWidths = widthSeed.map((width) => Math.max(48, width * scale));
+            const fontSize = safeColumns.length > 7 ? 6.5 : safeColumns.length > 4 ? 7.25 : 8;
+
+            doc.autoTable({
+                startY: cursorY,
+                margin,
+                tableWidth: contentWidth,
+                theme: "grid",
+                head: [safeColumns.map((column) => column.label)],
+                body: (rows.length ? rows : [{}]).map((row) => safeColumns.map((column) => stringifyExportValue(row?.[column.key] ?? "—") || "—")),
+                styles: {
+                    fontSize,
+                    cellPadding: { top: 4, right: 4, bottom: 4, left: 4 },
+                    overflow: "linebreak",
+                    valign: "top",
+                    lineColor: [226, 232, 240],
+                    lineWidth: 0.35,
+                },
+                headStyles: {
+                    fillColor: [243, 244, 246],
+                    textColor: [55, 65, 81],
+                    fontStyle: "bold",
+                    fontSize,
+                },
+                columnStyles: Object.fromEntries(scaledWidths.map((width, index) => [index, { cellWidth: width }])),
+                didDrawPage: () => drawPageHeader(),
+            });
+            cursorY = (doc.lastAutoTable?.finalY || cursorY) + 12;
+        };
+
+        const drawRawPayloadBlock = (text) => {
+            const rawText = stringifyExportValue(text || "—") || "—";
+            const lineHeight = 8.5;
+            const codePadding = 8;
+            const wrappedLines = doc.splitTextToSize(rawText, contentWidth - (codePadding * 2));
+            let offset = 0;
+
+            while (offset < wrappedLines.length) {
+                ensureSpace(34);
+                const availableHeight = pageHeight - margin.bottom - cursorY - (codePadding * 2);
+                const linesPerPage = Math.max(1, Math.floor(availableHeight / lineHeight));
+                const lineChunk = wrappedLines.slice(offset, offset + linesPerPage);
+                const boxHeight = (lineChunk.length * lineHeight) + (codePadding * 2);
+
+                doc.setFillColor(248, 250, 252);
+                doc.setDrawColor(226, 232, 240);
+                doc.roundedRect(margin.left, cursorY, contentWidth, boxHeight, 6, 6, "FD");
+                doc.setFont("courier", "normal");
+                doc.setFontSize(7);
+                doc.setTextColor(17, 24, 39);
+                doc.text(lineChunk, margin.left + codePadding, cursorY + codePadding + 5);
+
+                cursorY += boxHeight + 10;
+                offset += linesPerPage;
+            }
+        };
+
+        resetPageCursor();
+
+        messages.forEach((msg, msgIdx) => {
+            if (msgIdx > 0) {
+                doc.addPage();
+                resetPageCursor();
+            }
+
+            const meta = getExportMessageMeta(msg);
+            const messageRef = meta.messageReference || getReference(msg) || "—";
+            const summaryLine = [meta.messageType, meta.messageFormat, formatDirection(msg.io || msg.direction)].filter(Boolean).join("   ");
+
+            ensureSpace(30);
+            doc.setFont("helvetica", "bold");
+            doc.setFontSize(11);
+            doc.setTextColor(17, 24, 39);
+            doc.text(`Message Ref: ${messageRef}`, margin.left, cursorY);
+            cursorY += 14;
+
+            if (summaryLine) {
+                doc.setFont("helvetica", "normal");
+                doc.setFontSize(8);
+                doc.setTextColor(100, 116, 139);
+                doc.text(summaryLine, margin.left, cursorY);
+                cursorY += 10;
+            }
+
+            doc.setDrawColor(203, 213, 225);
+            doc.line(margin.left, cursorY, pageWidth - margin.right, cursorY);
+            cursorY += 14;
+
+            const rcRows = rawCopyMap.get(msg.reference || msg.messageReference || "") || [];
+
+            orderedKeys.forEach((targetKey) => {
+                const block = targetKey === "table"
+                    ? buildResultTableDataset([msg])
+                    : buildMessageSectionData(msg, targetKey, rcRows);
+                const blockColumns = targetKey === "rawcopies"
+                    ? block.columns.filter((column) => !["senderAddress", "receiverAddress", "protocol", "receivedAt", "inputType", "source"].includes(column.key))
+                    : block.columns;
+
+                drawSectionHeading(getExportTargetLabel(targetKey));
+
+                const isPairBlock = blockColumns.length === 2 && blockColumns.some(col => col.key === "field") && blockColumns.some(col => col.key === "value");
+                if (targetKey === "rawpayload") {
+                    drawRawPayloadBlock(getRawPayloadText(msg));
+                    return;
+                }
+
+                if (isPairBlock) {
+                    drawPairTable(block.rows.map((row) => [stringifyExportValue(row.field || "—"), stringifyExportValue(row.value || "—")]));
+                    return;
+                }
+
+                if (block.rows.length === 1 && blockColumns.length > 4) {
+                    const single = block.rows[0] || {};
+                    drawPairTable(blockColumns.map((column) => [column.label, stringifyExportValue(single[column.key] ?? "—") || "—"]));
+                    return;
+                }
+
+                drawDataTable(blockColumns, block.rows);
+            });
+        });
+
+        doc.save(`${fileBaseName}.pdf`);
+    }, [buildMessageSectionData, buildResultTableDataset, fetchRawCopiesByRefs, getExportMessageMeta, getExportTargetLabel, getReference]);
+
+    const runExport = async (scope, targetKeys, format) => {
         setShowExportMenu(false);
         setIsExporting(true);
         try {
+            const requestedKeys = Array.isArray(targetKeys) && targetKeys.length ? targetKeys : ["table"];
+            const orderedKeys = requestedKeys.includes("table") ? ["table"] : requestedKeys;
+            if (format === "word" && isWordExportDisabledForTargets(orderedKeys)) {
+                throw new Error("Word export is unavailable when Raw Copies is selected.");
+            }
             let messages;
             if (scope === "all") {
-                const label = MAIN_EXPORT_TARGETS.find(target => target.key === targetKey)?.label || "data";
+                const label = orderedKeys.map(getExportTargetLabel).join(" + ") || "data";
                 showToast(`Fetching all ${serverTotal.toLocaleString()} records for ${label} export…`, "info");
                 messages = await fetchAllRows();
             } else {
                 messages = getExportRows(scope) || [];
+                messages = await ensureDetailedMessages(messages, orderedKeys);
             }
 
-            const dataset = await buildSectionDataset(messages, targetKey);
+            if (MT_RAW_ONLY_EXPORT_FORMATS.has(format)) {
+                if (orderedKeys.length !== 1 || orderedKeys[0] !== "rawpayload") throw new Error("RJE / DOSPCC export is available only when Raw Payload is the only selected section.");
+                const result = exportMtRawPayloads({
+                    format,
+                    messages,
+                    fileBaseName: `swift_messages_raw_payload_${scope}`,
+                });
+                const fmtLabel = format.toUpperCase();
+                const skippedBits = [];
+                if (result.skippedNonMt) skippedBits.push(`${result.skippedNonMt.toLocaleString()} non-MT skipped`);
+                if (result.skippedMissing) skippedBits.push(`${result.skippedMissing.toLocaleString()} missing payload`);
+                showToast(`Exported ${result.exportedCount.toLocaleString()} MT raw payload message${result.exportedCount === 1 ? "" : "s"} as ${fmtLabel}${skippedBits.length ? ` (${skippedBits.join(", ")})` : ""}`);
+                return;
+            }
+
+            if (format === "pdf" && !(orderedKeys.length === 1 && orderedKeys[0] === "table")) {
+                const label = orderedKeys.map(getExportTargetLabel).join(" + ");
+                const fileBaseName = `swift_messages_${safeFileNamePart(label.toLowerCase().replace(/\s+/g, "_"))}_${scope}`;
+                await exportOrderedSectionsPdf({
+                    messages,
+                    orderedKeys,
+                    fileBaseName,
+                    exportTitle: `${label} - SWIFT Messages`,
+                });
+                showToast(`Exported ${label} (${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"}) as PDF`);
+                return;
+            }
+
+            if (format === "word" && !(orderedKeys.length === 1 && orderedKeys[0] === "table")) {
+                const label = orderedKeys.map(getExportTargetLabel).join(" + ");
+                const fileBaseName = `swift_messages_${safeFileNamePart(label.toLowerCase().replace(/\s+/g, "_"))}_${scope}`;
+                await exportOrderedSectionsWord({
+                    messages,
+                    orderedKeys,
+                    fileBaseName,
+                    exportTitle: `${label} - SWIFT Messages`,
+                });
+                showToast(`Exported ${label} (${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"}) as Word`);
+                return;
+            }
+
+            if (format === "json" && !(orderedKeys.length === 1 && orderedKeys[0] === "table")) {
+                const label = orderedKeys.map(getExportTargetLabel).join(" + ");
+                const payload = await buildOrderedSectionJson(messages, orderedKeys);
+                triggerDownload(
+                    new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }),
+                    `swift_messages_${safeFileNamePart(label.toLowerCase().replace(/\s+/g, "_"))}_${scope}.json`
+                );
+                showToast(`Exported ${label} (${messages.length.toLocaleString()} message${messages.length === 1 ? "" : "s"}) as JSON`);
+                return;
+            }
+
+            const dataset = await buildOrderedSectionDataset(messages, orderedKeys);
             await exportRowsAsFile({
                 format,
                 rows: dataset.rows,
@@ -2902,6 +4128,7 @@ function Search() {
                 fileBaseName: `swift_messages_${safeFileNamePart(dataset.label.toLowerCase().replace(/\s+/g, "_"))}_${scope}`,
                 title: `${dataset.label} - SWIFT Messages`,
                 sheetName: dataset.label,
+                forceGenericPdf: orderedKeys.length > 1,
             });
             showToast(`Exported ${dataset.label} (${dataset.rows.length.toLocaleString()} rows) as ${format.toUpperCase()}`);
         } catch (e) {
@@ -2930,7 +4157,7 @@ function Search() {
         if(col.key==="status")           return <span className={statusCls(value)}>{value??"—"}</span>;
         if(col.key==="amount")           { if(value===undefined||value===null)return "—"; return Number(value).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}); }
         if(col.key==="direction")        return <span className={`dir-badge ${dirClass(value)}`}>{formatDirection(value)}</span>;
-        if(col.key==="sequenceNumber")   return <span style={{fontFamily:"var(--mono)",fontWeight:600}}>{value??"—"}</span>;
+        if(col.key==="sequenceNumber" || col.key==="sessionNumber") return <span style={{fontFamily:"var(--mono)",fontWeight:600}}>{value??"—"}</span>;
         if(col.key==="possibleDuplicate"||col.key==="crossBorder") {
             if(value===true)  return <span style={{color:"var(--danger,#e24b4a)",fontWeight:600,fontSize:12}}>YES</span>;
             if(value===false) return <span style={{color:"var(--ok,#22c55e)",fontWeight:500,fontSize:12}}>NO</span>;
@@ -2954,6 +4181,23 @@ function Search() {
     const activeFilterCount=Object.values(searchState).filter(v=>v!=="").length;
     const extraWidth=180+(shownCols.length>7?(shownCols.length-7)*130:0);
     const scopeTabs=[{key:"all",label:"All",count:serverTotal},{key:"page",label:"This Page",count:currentRecords.length},{key:"selected",label:"Selected",count:selectedRows.size}];
+    const orderedExportTargets = exportTargets.length ? exportTargets : ["table"];
+    const toggleExportTarget = useCallback((targetKey) => {
+        setExportTargets((prev) => {
+            if (targetKey === "table") return ["table"];
+
+            const withoutTable = prev.filter(key => key !== "table");
+            if (withoutTable.includes(targetKey)) {
+                return withoutTable.length === 1 ? withoutTable : withoutTable.filter(key => key !== targetKey);
+            }
+            return [...withoutTable, targetKey];
+        });
+    }, []);
+    const mainExportFormats = useMemo(() => getExportFormatOptions({
+        targetKey: orderedExportTargets.length === 1 ? orderedExportTargets[0] : "",
+        includeMtOnly: orderedExportTargets.length === 1 && orderedExportTargets[0] === "rawpayload",
+        selectedTargets: orderedExportTargets,
+    }), [orderedExportTargets]);
 
     // ── Advanced field renderer ───────────────────────────────────────────────
     const renderAdvancedField = (fieldKey) => {
@@ -3023,7 +4267,7 @@ function Search() {
 
     const allGroups = useMemo(()=>{
         const groups = new Set(FIELD_GROUPS);
-        activeFieldDefs.forEach(f=>{ if(f.group) groups.add(f.group); });
+        activeFieldDefs.forEach(f=>{ if(f.group && !ADV_HIDDEN_GROUPS.has(f.group)) groups.add(f.group); });
         return [...groups];
     }, [activeFieldDefs]);
 
@@ -3089,6 +4333,17 @@ function Search() {
         const y = Math.max(20, Math.min(vh - h - 20, (vh - h) / 2 + off));
         topZRef.current += 1;
         setOpenModals(ms => [...ms, { id, msg, msgKey, tab: "header", pos: { x, y }, size: { w, h }, zIndex: topZRef.current, index: absIdx }]);
+
+        const ref = msg.reference || msg.messageReference;
+        if (ref && !(msg.rawMessage || msg.block4Fields || msg.historyLines)) {
+            fetch(`${API_DETAIL_BY_REF_URL}/${encodeURIComponent(ref)}`, { headers: authHeaders() })
+                .then(r => { if (!r.ok) throw new Error(`Detail fetch failed (${r.status})`); return r.json(); })
+                .then(detail => {
+                    if (!detail) return;
+                    setOpenModals(ms => ms.map(m => m.id === id ? { ...m, msg: detail } : m));
+                })
+                .catch(() => {});
+        }
     };
 
     const closeModal = (id) => {
@@ -3164,47 +4419,8 @@ function Search() {
                     {!rcPanelCollapsed && (
                         <div className="rc-grid">
                             <div className="rc-field"><label>Message Reference</label><input placeholder="e.g. KCRJ48066072DGTF" value={rcFilters.messageReference} onChange={setRcField("messageReference")} onKeyDown={handleRcKey}/></div>
-                            <div className="rc-field"><label>Message ID</label><input placeholder="Internal message ID" value={rcFilters.messageId} onChange={setRcField("messageId")} onKeyDown={handleRcKey}/></div>
                             <div className="rc-field"><label>Sender BIC</label><input placeholder="e.g. ABNANL2AXXX" value={rcFilters.sender} onChange={setRcField("sender")} onKeyDown={handleRcKey}/></div>
                             <div className="rc-field"><label>Receiver BIC</label><input placeholder="e.g. RBOSGB2LXXX" value={rcFilters.receiver} onChange={setRcField("receiver")} onKeyDown={handleRcKey}/></div>
-                            <div className="rc-field"><label>Message Type</label>
-                                <select value={rcFilters.messageTypeCode} onChange={setRcField("messageTypeCode")} onKeyDown={handleRcKey} disabled={rcOptsLoading}>
-                                    <option value="">{rcOptsLoading ? "Loading…" : "All Types"}</option>
-                                    {(rcOpts.messageTypeCodes || []).map(o => <option key={o} value={o}>{o}</option>)}
-                                </select>
-                            </div>
-                            <div className="rc-field"><label>Direction</label>
-                                <select value={rcFilters.direction} onChange={setRcField("direction")} onKeyDown={handleRcKey} disabled={rcOptsLoading}>
-                                    <option value="">{rcOptsLoading ? "Loading…" : "All Directions"}</option>
-                                    {(rcOpts.directions || []).map(o => <option key={o} value={o}>{o}</option>)}
-                                </select>
-                            </div>
-                            <div className="rc-field"><label>Status</label>
-                                <select value={rcFilters.currentStatus} onChange={setRcField("currentStatus")} onKeyDown={handleRcKey} disabled={rcOptsLoading}>
-                                    <option value="">{rcOptsLoading ? "Loading…" : "All Statuses"}</option>
-                                    {(rcOpts.statuses || []).map(o => <option key={o} value={o}>{o}</option>)}
-                                </select>
-                            </div>
-                            <div className="rc-field"><label>Protocol</label>
-                                <select value={rcFilters.protocol} onChange={setRcField("protocol")} onKeyDown={handleRcKey} disabled={rcOptsLoading}>
-                                    <option value="">{rcOptsLoading ? "Loading…" : "All Protocols"}</option>
-                                    {(rcOpts.protocols || []).map(o => <option key={o} value={o}>{o}</option>)}
-                                </select>
-                            </div>
-                            <div className="rc-field"><label>Input Type</label>
-                                <select value={rcFilters.inputType} onChange={setRcField("inputType")} onKeyDown={handleRcKey} disabled={rcOptsLoading}>
-                                    <option value="">{rcOptsLoading ? "Loading…" : "All Types"}</option>
-                                    {(rcOpts.inputTypes || []).map(o => <option key={o} value={o}>{o}</option>)}
-                                </select>
-                            </div>
-                            <div className="rc-field"><label>Source</label>
-                                <select value={rcFilters.source} onChange={setRcField("source")} onKeyDown={handleRcKey} disabled={rcOptsLoading}>
-                                    <option value="">{rcOptsLoading ? "Loading…" : "All Sources"}</option>
-                                    {(rcOpts.sources || []).map(o => <option key={o} value={o}>{o}</option>)}
-                                </select>
-                            </div>
-                            <div className="rc-field"><label>Received From</label><input type="date" value={rcFilters.startDate} onChange={setRcField("startDate")} onKeyDown={handleRcKey}/></div>
-                            <div className="rc-field"><label>Received To</label><input type="date" value={rcFilters.endDate} onChange={setRcField("endDate")} onKeyDown={handleRcKey}/></div>
                             <div className="rc-field rc-field-wide"><label>Free Search (across reference, sender, receiver, raw content)</label>
                                 <input placeholder="Search across all fields…" value={rcFilters.freeText} onChange={setRcField("freeText")} onKeyDown={handleRcKey}/>
                             </div>
@@ -3250,7 +4466,7 @@ function Search() {
                                 <thead>
                                     <tr>
                                         <th style={{width:36}}/><th style={{width:40}}>#</th>
-                                        <th>Message ID</th><th>Type</th><th>Direction</th>
+                                        <th>Message Reference</th><th>Type</th><th>Direction</th>
                                         <th>Status</th><th>Sender</th><th>Receiver</th>
                                         <th>Protocol</th><th>Received At</th>
                                     </tr>
@@ -3282,7 +4498,7 @@ function Search() {
                                                             </button>
                                                         </td>
                                                         <td style={{color:"var(--gray-3)",fontWeight:600,fontSize:12}}>{ri + 1}</td>
-                                                        <td className="rc-mono" style={{fontSize:11}}>{row.messageId ? row.messageId.slice(0,20) + (row.messageId.length > 20 ? "…" : "") : "—"}</td>
+                                                        <td className="rc-mono" style={{fontSize:11}}>{row.messageReference ? row.messageReference.slice(0,20) + (row.messageReference.length > 20 ? "…" : "") : "—"}</td>
                                                         <td><span style={{fontFamily:"monospace",fontWeight:700,fontSize:12}}>{row.messageTypeCode || "—"}</span></td>
                                                         <td><span className={rcDirCls(row.direction)}>{row.direction || "—"}</span></td>
                                                         <td><span className={rcStatusCls(row.currentStatus)}>{row.currentStatus || "—"}</span></td>
@@ -3440,6 +4656,8 @@ function Search() {
                         <div className="row">
                             <div className="field-group"><label>Seq No. From</label><input type="number" placeholder="e.g. 1" value={searchState.seqFrom} onChange={set("seqFrom")} onKeyDown={handleKeyDown}/></div>
                             <div className="field-group"><label>Seq No. To</label><input type="number" placeholder="e.g. 9999" value={searchState.seqTo} onChange={set("seqTo")} onKeyDown={handleKeyDown}/></div>
+                            <div className="field-group"><label>Session No.</label><input placeholder="e.g. 0001" value={searchState.sessionNumber} onChange={set("sessionNumber")} onKeyDown={handleKeyDown}/></div>
+                            <div className="field-group"><label>Logical Terminal</label><input placeholder="e.g. BPXAINAAXPUN" value={searchState.logicalTerminalAddress} onChange={set("logicalTerminalAddress")} onKeyDown={handleKeyDown}/></div>
                             <div className="field-group field-group-wide"><label>UETR</label><input className="input-wide" placeholder="Enter UETR (e.g. 8a562c65-...)" value={searchState.uetr} onChange={set("uetr")} onKeyDown={handleKeyDown}/></div>
                         </div>
                         <div className="row" style={{alignItems:"flex-end"}}>
@@ -3576,21 +4794,32 @@ function Search() {
                             <div className="export-section-block">
                                 <div className="txn-export-scope-label">Export Section</div>
                                 <div className="txn-export-scope-grid">
-                                    {MAIN_EXPORT_TARGETS.map(target=>(
-                                        <button key={target.key} className={`txn-export-scope-btn${exportTarget===target.key?" active":""}`} onClick={()=>setExportTarget(target.key)}>
-                                            {target.label}
+                                    {MAIN_EXPORT_TARGETS.map(target=>{
+                                        const order = orderedExportTargets.indexOf(target.key) + 1;
+                                        return (
+                                        <button key={target.key} className={`txn-export-scope-btn${order?" active":""}`} onClick={()=>toggleExportTarget(target.key)}>
+                                            <span>{target.label}</span>
+                                            {order ? <span className="txn-export-order-badge">{order}</span> : null}
                                         </button>
-                                    ))}
+                                    );})}
                                 </div>
                             </div>
                             <div className="export-format-divider"><span>Format</span></div>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"csv")}><span className="export-opt-icon export-icon-csv">CSV</span><span className="export-opt-info"><span className="export-opt-name">Comma Separated</span><span className="export-opt-ext">.csv</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"excel")}><span className="export-opt-icon export-icon-xlsx">XLS</span><span className="export-opt-info"><span className="export-opt-name">Excel Workbook</span><span className="export-opt-ext">.xlsx</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"json")}><span className="export-opt-icon export-icon-json">JSON</span><span className="export-opt-info"><span className="export-opt-name">JSON Data</span><span className="export-opt-ext">.json</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"pdf")}><span className="export-opt-icon export-icon-pdf">PDF</span><span className="export-opt-info"><span className="export-opt-name">Portable Document</span><span className="export-opt-ext">.pdf</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"word")}><span className="export-opt-icon export-icon-word">DOC</span><span className="export-opt-info"><span className="export-opt-name">Word Document</span><span className="export-opt-ext">.doc</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"xml")}><span className="export-opt-icon export-icon-xml">XML</span><span className="export-opt-info"><span className="export-opt-name">XML Data</span><span className="export-opt-ext">.xml</span></span></button>
-                            <button className="export-opt" onClick={()=>runExport(exportScope,exportTarget,"txt")}><span className="export-opt-icon export-icon-txt">TXT</span><span className="export-opt-info"><span className="export-opt-name">Plain Text</span><span className="export-opt-ext">.txt</span></span></button>
+                            {mainExportFormats.map((option) => (
+                                <button
+                                    key={option.key}
+                                    className="export-opt"
+                                    onClick={()=>runExport(exportScope,orderedExportTargets,option.key)}
+                                    disabled={option.disabled}
+                                    title={option.disabledReason || undefined}
+                                >
+                                    <span className={`export-opt-icon ${option.iconClass}`}>{option.iconText}</span>
+                                    <span className="export-opt-info">
+                                        <span className="export-opt-name">{option.name}</span>
+                                        <span className="export-opt-ext">{option.ext}</span>
+                                    </span>
+                                </button>
+                            ))}
                         </div>}
                     </div>
                 </div>
@@ -3650,7 +4879,17 @@ function Search() {
                         <input className="pg-goto" type="number" min="1" max={totalPages} value={goToPage} placeholder="pg" onChange={e=>setGoToPage(e.target.value)} onKeyDown={e=>{ if(e.key==="Enter"){const p=parseInt(goToPage);if(p>=1&&p<=totalPages)handlePageClick(p);setGoToPage("");}}}/>
                         <span className="pg-of-total">of {totalPages}</span><span className="pg-divider"/>
                         <label className="pg-label">Rows</label>
-                        <select className="pg-rows-select" value={recordsPerPage} onChange={e=>{setRecordsPerPage(Number(e.target.value));setCurrentPage(1);setStartPage(1);}}>
+                        <select
+                            className="pg-rows-select"
+                            value={recordsPerPage}
+                            onChange={e=>{
+                                const nextSize = Number(e.target.value);
+                                setRecordsPerPage(nextSize);
+                                setCurrentPage(1);
+                                setStartPage(1);
+                                if (showResult) handleSearch(0, nextSize);
+                            }}
+                        >
                             <option value={10}>10</option><option value={20}>20</option><option value={50}>50</option><option value={100}>100</option>
                         </select>
                     </div>
