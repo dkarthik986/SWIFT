@@ -28,6 +28,8 @@ public class AppConfig {
 
     @Value("${mongo.collection.audit:audit_logs}")
     private String auditCollection;
+    @Value("${search.export.excel-max-rows-per-sheet:1048575}")
+    private int exportExcelMaxRowsPerSheet;
 
     // ── Search ────────────────────────────────────────────────────────────
     @Value("${search.default-page-size:20}")
@@ -59,6 +61,21 @@ public class AppConfig {
 
     @Value("${mongo.collection.mt-labels:mt_lable}")
     private String mtLabelsCollection;
+
+    @Value("${mongo.collection.dropdown-options:drop_down}")
+    private String dropdownOptionsCollection;
+
+    @Value("${search.dropdown.document-id:search_dropdown_options}")
+    private String dropdownOptionsDocumentId;
+
+    @Value("${search.dropdown.refresh-enabled:true}")
+    private boolean dropdownRefreshEnabled;
+
+    @Value("${search.dropdown.refresh-interval-hours:6}")
+    private long dropdownRefreshIntervalHours;
+
+    @Value("${search.dropdown.refresh-initial-delay-minutes:5}")
+    private long dropdownRefreshInitialDelayMinutes;
 
     // ── Admin ─────────────────────────────────────────────────────────────
     @Value("${admin.protected-id:ADMIN001}")

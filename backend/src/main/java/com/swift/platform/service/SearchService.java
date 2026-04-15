@@ -2,14 +2,28 @@ package com.swift.platform.service;
 
 import com.swift.platform.config.AppConfig;
 import com.swift.platform.dto.DropdownOptionsResponse;
+import com.swift.platform.dto.ExportColumnRequest;
 import com.swift.platform.dto.PagedResponse;
 import com.swift.platform.dto.SearchResponse;
+import com.mongodb.client.model.ReplaceOptions;
 import lombok.RequiredArgsConstructor;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.xssf.streaming.SXSSFWorkbook;
 import org.bson.Document;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.OutputStreamWriter;
+import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -20,7 +34,11 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import com.mongodb.client.FindIterable;
 
@@ -29,6 +47,11 @@ import com.mongodb.client.FindIterable;
 public class SearchService {
 
     private static final String PAYLOAD_ALIAS = "payloadDoc";
+    private static final int DROPDOWN_SNAPSHOT_VERSION = 2;
+    private static final int EXCEL_HARD_MAX_ROWS_PER_SHEET = 1_048_575;
+    private static final Pattern TEXT_PAYLOAD_TAG_LINE_PATTERN = Pattern.compile("^\\s*(.*?)\\s*:(\\d{2}[A-Z]?):\\s*(.*)$");
+    private static final Pattern GENERIC_TEXT_PAYLOAD_LABEL_PATTERN = Pattern.compile("(?i)^line\\s+\\d+.*$");
+    private static final Map<String, Field> SEARCH_RESPONSE_FIELDS = initSearchResponseFields();
     private static final Set<String> LOOKUP_REQUIRED_PARAMS = Set.of(
             "mur", "correspondent", "block4Tag", "block4Value", "freeSearchText"
     );
@@ -80,24 +103,44 @@ public class SearchService {
 
     private final MongoTemplate mongoTemplate;
     private final AppConfig appConfig;
-    private volatile CachedValue<DropdownOptionsResponse> dropdownOptionsCache;
     private volatile CachedValue<Long> unfilteredCountCache;
 
     public DropdownOptionsResponse getDropdownOptions() {
-        CachedValue<DropdownOptionsResponse> cache = dropdownOptionsCache;
-        if (cache != null && !cache.isExpired(appConfig.getMetadataCacheTtlMs())) {
-            return cache.value();
-        }
+        DropdownOptionsResponse response = readDropdownOptionsSnapshot();
+        return response != null ? response : refreshDropdownOptionsSnapshot();
+    }
 
+    @Scheduled(
+            fixedDelayString = "#{T(java.time.Duration).ofHours(${search.dropdown.refresh-interval-hours:6}).toMillis()}",
+            initialDelayString = "#{T(java.time.Duration).ofMinutes(${search.dropdown.refresh-initial-delay-minutes:5}).toMillis()}"
+    )
+    public void refreshDropdownOptionsSnapshotOnSchedule() {
+        if (!appConfig.isDropdownRefreshEnabled()) {
+            return;
+        }
+        refreshDropdownOptionsSnapshot();
+    }
+
+    public DropdownOptionsResponse refreshDropdownOptionsSnapshot() {
+        DropdownOptionsResponse response = buildFreshDropdownOptions();
+        saveDropdownOptionsSnapshot(response);
+        return response;
+    }
+
+    private DropdownOptionsResponse buildFreshDropdownOptions() {
         String messagesCol = appConfig.getSwiftCollection();
         String payloadsCol = appConfig.getPayloadsCollection();
 
         DropdownOptionsResponse res = new DropdownOptionsResponse();
         res.setFormats(Arrays.asList("MT", "MX"));
 
-        List<String> codes = distinctMerged(messagesCol, "messageTypeCode", "header.messageTypeCode");
-        List<String> mtCodes = codes.stream().filter(code -> code.toUpperCase().startsWith("MT")).sorted().collect(Collectors.toList());
-        List<String> mxCodes = codes.stream().filter(code -> !code.toUpperCase().startsWith("MT")).sorted().collect(Collectors.toList());
+        List<String> mtCodes = distinctMessageCodesByFamily(messagesCol, "MT");
+        List<String> mxCodes = distinctMessageCodesByFamily(messagesCol, "MX");
+        LinkedHashSet<String> mergedCodes = new LinkedHashSet<>();
+        mergedCodes.addAll(mtCodes);
+        mergedCodes.addAll(mxCodes);
+        mergedCodes.addAll(distinctMerged(messagesCol, "messageTypeCode", "header.messageTypeCode"));
+        List<String> codes = mergedCodes.stream().sorted().collect(Collectors.toList());
 
         res.setMessageCodes(codes);
         res.setTypes(codes);
@@ -152,9 +195,146 @@ public class SearchService {
         res.setMessagePriorities(distinctMerged(messagesCol, "finMessagePriority", "protocolParams.messagePriority"));
         res.setNackCodes(Collections.emptyList());
         res.setCopyIndicators(Collections.emptyList());
-
-        dropdownOptionsCache = new CachedValue<>(res, System.currentTimeMillis());
         return res;
+    }
+
+    private DropdownOptionsResponse readDropdownOptionsSnapshot() {
+        try {
+            List<DropdownFieldSpec> specs = dropdownFieldSpecs();
+            List<String> snapshotIds = specs.stream()
+                    .map(spec -> buildDropdownSnapshotId(spec.key()))
+                    .collect(Collectors.toList());
+
+            List<Document> docs = mongoTemplate.getCollection(appConfig.getDropdownOptionsCollection())
+                    .find(new Document("_id", new Document("$in", snapshotIds)))
+                    .into(new ArrayList<>());
+
+            if (docs.size() < specs.size()) {
+                return null;
+            }
+
+            Map<String, List<String>> valuesByField = new HashMap<>();
+            for (Document doc : docs) {
+                Object snapshotVersion = doc.get("schemaVersion");
+                if (!(snapshotVersion instanceof Number number) || number.intValue() != DROPDOWN_SNAPSHOT_VERSION) {
+                    return null;
+                }
+                String field = firstNonBlank(doc.getString("field"), extractFieldKeyFromSnapshotId(doc.getString("_id")));
+                if (notBlank(field)) {
+                    valuesByField.put(field, normalizeDropdownValues(toStringList(doc.get("values"))));
+                }
+            }
+
+            if (specs.stream().map(DropdownFieldSpec::key).anyMatch(field -> !valuesByField.containsKey(field))) {
+                return null;
+            }
+
+            DropdownOptionsResponse response = new DropdownOptionsResponse();
+            for (DropdownFieldSpec spec : specs) {
+                spec.setter().accept(response, valuesByField.getOrDefault(spec.key(), Collections.emptyList()));
+            }
+            return response;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void saveDropdownOptionsSnapshot(DropdownOptionsResponse response) {
+        if (response == null) {
+            return;
+        }
+
+        ReplaceOptions upsert = new ReplaceOptions().upsert(true);
+        String collectionName = appConfig.getDropdownOptionsCollection();
+        String groupId = appConfig.getDropdownOptionsDocumentId();
+        String updatedAt = Instant.now().toString();
+
+        for (DropdownFieldSpec spec : dropdownFieldSpecs()) {
+            List<String> values = normalizeDropdownValues(spec.getter().apply(response));
+            Document doc = new Document("_id", buildDropdownSnapshotId(spec.key()))
+                    .append("groupId", groupId)
+                    .append("schemaVersion", DROPDOWN_SNAPSHOT_VERSION)
+                    .append("field", spec.key())
+                    .append("values", values)
+                    .append("updatedAt", updatedAt);
+            mongoTemplate.getCollection(collectionName)
+                    .replaceOne(new Document("_id", doc.getString("_id")), doc, upsert);
+        }
+    }
+
+    private String buildDropdownSnapshotId(String fieldKey) {
+        return appConfig.getDropdownOptionsDocumentId() + ":" + fieldKey;
+    }
+
+    private String extractFieldKeyFromSnapshotId(String snapshotId) {
+        if (!notBlank(snapshotId)) {
+            return null;
+        }
+        int separatorIndex = snapshotId.indexOf(':');
+        if (separatorIndex < 0 || separatorIndex >= snapshotId.length() - 1) {
+            return snapshotId;
+        }
+        return snapshotId.substring(separatorIndex + 1);
+    }
+
+    private List<String> normalizeDropdownValues(List<String> values) {
+        if (values == null || values.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return values.stream()
+                .filter(this::notBlank)
+                .map(String::trim)
+                .collect(Collectors.toCollection(LinkedHashSet::new))
+                .stream()
+                .sorted()
+                .collect(Collectors.toList());
+    }
+
+    private List<DropdownFieldSpec> dropdownFieldSpecs() {
+        return List.of(
+                new DropdownFieldSpec("formats", DropdownOptionsResponse::setFormats, DropdownOptionsResponse::getFormats),
+                new DropdownFieldSpec("messageCodes", DropdownOptionsResponse::setMessageCodes, DropdownOptionsResponse::getMessageCodes),
+                new DropdownFieldSpec("types", DropdownOptionsResponse::setTypes, DropdownOptionsResponse::getTypes),
+                new DropdownFieldSpec("mtTypes", DropdownOptionsResponse::setMtTypes, DropdownOptionsResponse::getMtTypes),
+                new DropdownFieldSpec("mxTypes", DropdownOptionsResponse::setMxTypes, DropdownOptionsResponse::getMxTypes),
+                new DropdownFieldSpec("allMtMxTypes", DropdownOptionsResponse::setAllMtMxTypes, DropdownOptionsResponse::getAllMtMxTypes),
+                new DropdownFieldSpec("statuses", DropdownOptionsResponse::setStatuses, DropdownOptionsResponse::getStatuses),
+                new DropdownFieldSpec("phases", DropdownOptionsResponse::setPhases, DropdownOptionsResponse::getPhases),
+                new DropdownFieldSpec("actions", DropdownOptionsResponse::setActions, DropdownOptionsResponse::getActions),
+                new DropdownFieldSpec("ioDirections", DropdownOptionsResponse::setIoDirections, DropdownOptionsResponse::getIoDirections),
+                new DropdownFieldSpec("directions", DropdownOptionsResponse::setDirections, DropdownOptionsResponse::getDirections),
+                new DropdownFieldSpec("networkProtocols", DropdownOptionsResponse::setNetworkProtocols, DropdownOptionsResponse::getNetworkProtocols),
+                new DropdownFieldSpec("networks", DropdownOptionsResponse::setNetworks, DropdownOptionsResponse::getNetworks),
+                new DropdownFieldSpec("networkChannels", DropdownOptionsResponse::setNetworkChannels, DropdownOptionsResponse::getNetworkChannels),
+                new DropdownFieldSpec("backendChannels", DropdownOptionsResponse::setBackendChannels, DropdownOptionsResponse::getBackendChannels),
+                new DropdownFieldSpec("networkPriorities", DropdownOptionsResponse::setNetworkPriorities, DropdownOptionsResponse::getNetworkPriorities),
+                new DropdownFieldSpec("networkStatuses", DropdownOptionsResponse::setNetworkStatuses, DropdownOptionsResponse::getNetworkStatuses),
+                new DropdownFieldSpec("deliveryModes", DropdownOptionsResponse::setDeliveryModes, DropdownOptionsResponse::getDeliveryModes),
+                new DropdownFieldSpec("services", DropdownOptionsResponse::setServices, DropdownOptionsResponse::getServices),
+                new DropdownFieldSpec("senders", DropdownOptionsResponse::setSenders, DropdownOptionsResponse::getSenders),
+                new DropdownFieldSpec("receivers", DropdownOptionsResponse::setReceivers, DropdownOptionsResponse::getReceivers),
+                new DropdownFieldSpec("countries", DropdownOptionsResponse::setCountries, DropdownOptionsResponse::getCountries),
+                new DropdownFieldSpec("originCountries", DropdownOptionsResponse::setOriginCountries, DropdownOptionsResponse::getOriginCountries),
+                new DropdownFieldSpec("destinationCountries", DropdownOptionsResponse::setDestinationCountries, DropdownOptionsResponse::getDestinationCountries),
+                new DropdownFieldSpec("owners", DropdownOptionsResponse::setOwners, DropdownOptionsResponse::getOwners),
+                new DropdownFieldSpec("ownerUnits", DropdownOptionsResponse::setOwnerUnits, DropdownOptionsResponse::getOwnerUnits),
+                new DropdownFieldSpec("workflows", DropdownOptionsResponse::setWorkflows, DropdownOptionsResponse::getWorkflows),
+                new DropdownFieldSpec("workflowModels", DropdownOptionsResponse::setWorkflowModels, DropdownOptionsResponse::getWorkflowModels),
+                new DropdownFieldSpec("sourceSystems", DropdownOptionsResponse::setSourceSystems, DropdownOptionsResponse::getSourceSystems),
+                new DropdownFieldSpec("originatorApplications", DropdownOptionsResponse::setOriginatorApplications, DropdownOptionsResponse::getOriginatorApplications),
+                new DropdownFieldSpec("currencies", DropdownOptionsResponse::setCurrencies, DropdownOptionsResponse::getCurrencies),
+                new DropdownFieldSpec("processingTypes", DropdownOptionsResponse::setProcessingTypes, DropdownOptionsResponse::getProcessingTypes),
+                new DropdownFieldSpec("processPriorities", DropdownOptionsResponse::setProcessPriorities, DropdownOptionsResponse::getProcessPriorities),
+                new DropdownFieldSpec("profileCodes", DropdownOptionsResponse::setProfileCodes, DropdownOptionsResponse::getProfileCodes),
+                new DropdownFieldSpec("environments", DropdownOptionsResponse::setEnvironments, DropdownOptionsResponse::getEnvironments),
+                new DropdownFieldSpec("amlStatuses", DropdownOptionsResponse::setAmlStatuses, DropdownOptionsResponse::getAmlStatuses),
+                new DropdownFieldSpec("finCopies", DropdownOptionsResponse::setFinCopies, DropdownOptionsResponse::getFinCopies),
+                new DropdownFieldSpec("finCopyServices", DropdownOptionsResponse::setFinCopyServices, DropdownOptionsResponse::getFinCopyServices),
+                new DropdownFieldSpec("messagePriorities", DropdownOptionsResponse::setMessagePriorities, DropdownOptionsResponse::getMessagePriorities),
+                new DropdownFieldSpec("nackCodes", DropdownOptionsResponse::setNackCodes, DropdownOptionsResponse::getNackCodes),
+                new DropdownFieldSpec("copyIndicators", DropdownOptionsResponse::setCopyIndicators, DropdownOptionsResponse::getCopyIndicators),
+                new DropdownFieldSpec("reasons", DropdownOptionsResponse::setReasons, DropdownOptionsResponse::getReasons)
+        );
     }
 
     public PagedResponse<SearchResponse> search(Map<String, String> filters, int page, int size) {
@@ -191,34 +371,21 @@ public class SearchService {
     }
 
     public List<SearchResponse> searchAllForExport(Map<String, String> filters) {
-        String messagesCol = appConfig.getSwiftCollection();
-        SearchPlan plan = buildSearchPlan(filters);
+        List<SearchResponse> results = new ArrayList<>();
+        forEachExportResponse(filters, results::add);
+        return results;
+    }
 
-        if (appConfig.isOptimizeWithoutLookup() && !plan.requiresLookup()) {
-            List<SearchResponse> results = new ArrayList<>();
-            List<Document> batch = new ArrayList<>();
-            int batchSize = Math.max(1, appConfig.getExportFetchBatchSize());
-
-            FindIterable<Document> iterable = mongoTemplate.getCollection(messagesCol)
-                    .find(plan.messageMatch().isEmpty() ? new Document() : plan.messageMatch())
-                    .sort(new Document("header.dateCreated", -1).append("dateCreated", -1))
-                    .batchSize(batchSize);
-
-            for (Document doc : iterable) {
-                batch.add(doc);
-                if (batch.size() >= batchSize) {
-                    appendExportBatch(results, batch);
-                    batch.clear();
-                }
-            }
-            if (!batch.isEmpty()) {
-                appendExportBatch(results, batch);
-            }
-            return results;
+    public void streamResultTableExport(Map<String, String> filters,
+                                        List<ExportColumnRequest> columns,
+                                        String format,
+                                        OutputStream outputStream) throws IOException {
+        List<ExportColumnRequest> safeColumns = normalizeExportColumns(columns);
+        if ("excel".equalsIgnoreCase(format)) {
+            streamResultTableExcel(filters, safeColumns, outputStream);
+            return;
         }
-
-        List<Document> docs = aggregate(messagesCol, buildLookupPipeline(plan));
-        return docs.stream().map(this::toResponse).collect(Collectors.toList());
+        streamResultTableCsv(filters, safeColumns, outputStream);
     }
 
     public SearchResponse getMessageDetail(String reference) {
@@ -824,6 +991,7 @@ public class SearchService {
         compatibility.put("fieldCount", computePayloadFieldCount(mtParsedPayload, block4Fields));
         compatibility.put("payloadSize", payloadDoc.getString("payloadSize"));
         compatibility.put("payloadEncoding", payloadDoc.getString("payloadEncoding"));
+        compatibility.put("textPayload", payloadDoc.getString("textPayload"));
         compatibility.put("digest", payloadDoc.getString("digest"));
         compatibility.put("digestAlgorithm", payloadDoc.getString("digestAlgorithm"));
         return compatibility;
@@ -856,7 +1024,13 @@ public class SearchService {
             return enrichMtBlock4Labels(messageType, messageCode, rows);
         }
 
-        return enrichMtBlock4Labels(messageType, messageCode, buildBlock4FieldsFromRawFin(rawFin));
+        List<Map<String, Object>> rawFinRows = buildBlock4FieldsFromRawFin(rawFin);
+        if (!rawFinRows.isEmpty()) {
+            return enrichMtBlock4Labels(messageType, messageCode, rawFinRows);
+        }
+
+        String textPayload = firstNonBlank(payloadDoc.getString("textPayload"), mtParsedPayload.getString("textPayload"));
+        return enrichMtBlock4Labels(messageType, messageCode, buildBlock4FieldsFromTextPayload(textPayload));
     }
 
     private List<Map<String, Object>> buildBlock4FieldsFromRawFin(String rawFin) {
@@ -910,6 +1084,62 @@ public class SearchService {
         return rows;
     }
 
+    private List<Map<String, Object>> buildBlock4FieldsFromTextPayload(String textPayload) {
+        if (!notBlank(textPayload)) {
+            return Collections.emptyList();
+        }
+
+        List<Map<String, Object>> rows = new ArrayList<>();
+        String currentTag = null;
+        String currentLabel = null;
+        String pendingLabel = null;
+        StringBuilder currentValue = new StringBuilder();
+        String normalized = textPayload.replace("\r\n", "\n").replace('\r', '\n');
+
+        for (String rawLine : normalized.split("\n")) {
+            String line = rawLine == null ? "" : rawLine;
+            String trimmed = line.trim();
+
+            if (trimmed.isEmpty()) {
+                if (currentTag != null && currentValue.length() > 0) {
+                    currentValue.append('\n');
+                }
+                continue;
+            }
+
+            Matcher matcher = TEXT_PAYLOAD_TAG_LINE_PATTERN.matcher(line);
+            if (matcher.matches()) {
+                if (currentTag != null) {
+                    rows.add(block4Row(currentTag, currentLabel, cleanBlock4Value(currentValue.toString())));
+                }
+                currentTag = matcher.group(2).trim();
+                currentLabel = resolveTextPayloadLabel(matcher.group(1), pendingLabel);
+                pendingLabel = null;
+                currentValue.setLength(0);
+                String initialValue = cleanBlock4Value(matcher.group(3));
+                if (notBlank(initialValue)) {
+                    currentValue.append(initialValue);
+                }
+                continue;
+            }
+
+            if (currentTag != null) {
+                if (currentValue.length() > 0) {
+                    currentValue.append('\n');
+                }
+                currentValue.append(line.stripTrailing());
+            } else {
+                pendingLabel = trimmed;
+            }
+        }
+
+        if (currentTag != null) {
+            rows.add(block4Row(currentTag, currentLabel, cleanBlock4Value(currentValue.toString())));
+        }
+
+        return rows;
+    }
+
     private Map<String, Object> block4Row(String tag, String label, String value) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("tag", tag);
@@ -917,6 +1147,26 @@ public class SearchService {
         row.put("rawValue", value == null || value.isBlank() ? "—" : value);
         row.put("components", Collections.emptyMap());
         return row;
+    }
+
+    private String resolveTextPayloadLabel(String inlineLabel, String pendingLabel) {
+        String cleanedInlineLabel = cleanTextPayloadLabel(inlineLabel);
+        String cleanedPendingLabel = cleanTextPayloadLabel(pendingLabel);
+        if (notBlank(cleanedInlineLabel) && !GENERIC_TEXT_PAYLOAD_LABEL_PATTERN.matcher(cleanedInlineLabel).matches()) {
+            return cleanedInlineLabel;
+        }
+        if (notBlank(cleanedPendingLabel)) {
+            return cleanedPendingLabel;
+        }
+        return notBlank(cleanedInlineLabel) ? cleanedInlineLabel : null;
+    }
+
+    private String cleanTextPayloadLabel(String label) {
+        if (!notBlank(label)) {
+            return null;
+        }
+        String cleaned = label.strip();
+        return cleaned.isEmpty() ? null : cleaned;
     }
 
     private List<Map<String, Object>> existingBlock4Fields(Document payloadDoc, Document mtParsedPayload) {
@@ -1257,10 +1507,231 @@ public class SearchService {
     }
 
     private void appendExportBatch(List<SearchResponse> target, List<Document> docs) {
+        appendExportBatch(docs, target::add);
+    }
+
+    private void appendExportBatch(List<Document> docs, Consumer<SearchResponse> consumer) {
         Map<String, Document> payloadByReference = fetchPayloadsByReference(docs);
         docs.stream()
                 .map(doc -> toResponse(withPayloadDoc(doc, payloadByReference.get(stringValue(doc.get("messageReference"))))))
-                .forEach(target::add);
+                .forEach(consumer);
+    }
+
+    private void forEachExportResponse(Map<String, String> filters, Consumer<SearchResponse> consumer) {
+        String messagesCol = appConfig.getSwiftCollection();
+        SearchPlan plan = buildSearchPlan(filters);
+        int batchSize = Math.max(1, appConfig.getExportFetchBatchSize());
+
+        if (appConfig.isOptimizeWithoutLookup() && !plan.requiresLookup()) {
+            List<Document> batch = new ArrayList<>(batchSize);
+            FindIterable<Document> iterable = mongoTemplate.getCollection(messagesCol)
+                    .find(plan.messageMatch().isEmpty() ? new Document() : plan.messageMatch())
+                    .sort(new Document("header.dateCreated", -1).append("dateCreated", -1))
+                    .batchSize(batchSize);
+
+            for (Document doc : iterable) {
+                batch.add(doc);
+                if (batch.size() >= batchSize) {
+                    appendExportBatch(batch, consumer);
+                    batch.clear();
+                }
+            }
+            if (!batch.isEmpty()) {
+                appendExportBatch(batch, consumer);
+            }
+            return;
+        }
+
+        for (Document doc : mongoTemplate.getCollection(messagesCol)
+                .aggregate(buildLookupPipeline(plan))
+                .allowDiskUse(true)
+                .batchSize(batchSize)) {
+            consumer.accept(toResponse(doc));
+        }
+    }
+
+    private void streamResultTableCsv(Map<String, String> filters,
+                                      List<ExportColumnRequest> columns,
+                                      OutputStream outputStream) throws IOException {
+        try (BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(outputStream, StandardCharsets.UTF_8))) {
+            writer.write(columns.stream()
+                    .map(ExportColumnRequest::getLabel)
+                    .map(this::escapeCsvCell)
+                    .collect(Collectors.joining(",")));
+            writer.newLine();
+
+            try {
+                forEachExportResponse(filters, response -> writeCsvRow(writer, columns, response));
+            } catch (UncheckedIOException ex) {
+                throw ex.getCause();
+            }
+            writer.flush();
+        }
+    }
+
+    private void streamResultTableExcel(Map<String, String> filters,
+                                        List<ExportColumnRequest> columns,
+                                        OutputStream outputStream) throws IOException {
+        int maxRowsPerSheet = Math.max(1, Math.min(EXCEL_HARD_MAX_ROWS_PER_SHEET, appConfig.getExportExcelMaxRowsPerSheet()));
+
+        try (SXSSFWorkbook workbook = new SXSSFWorkbook(500)) {
+            workbook.setCompressTempFiles(true);
+
+            ExcelSheetCursor cursor = createExcelSheet(workbook, columns, 1);
+            try {
+                forEachExportResponse(filters, response -> {
+                    if (cursor.dataRows >= maxRowsPerSheet) {
+                        cursor.sheetIndex += 1;
+                        cursor.sheet = createSheetWithHeader(workbook, columns, cursor.sheetIndex);
+                        cursor.rowIndex = 1;
+                        cursor.dataRows = 0;
+                    }
+                    Row row = cursor.sheet.createRow(cursor.rowIndex++);
+                    writeExcelRow(row, columns, response);
+                    cursor.dataRows += 1;
+                });
+                workbook.write(outputStream);
+                outputStream.flush();
+            } finally {
+                workbook.dispose();
+            }
+        }
+    }
+
+    private ExcelSheetCursor createExcelSheet(SXSSFWorkbook workbook, List<ExportColumnRequest> columns, int sheetIndex) {
+        Sheet sheet = createSheetWithHeader(workbook, columns, sheetIndex);
+        return new ExcelSheetCursor(sheet, sheetIndex, 1, 0);
+    }
+
+    private Sheet createSheetWithHeader(SXSSFWorkbook workbook, List<ExportColumnRequest> columns, int sheetIndex) {
+        Sheet sheet = workbook.createSheet(sheetIndex == 1 ? "Export" : "Export " + sheetIndex);
+        Row headerRow = sheet.createRow(0);
+        for (int i = 0; i < columns.size(); i++) {
+            headerRow.createCell(i).setCellValue(columns.get(i).getLabel());
+            sheet.setColumnWidth(i, 24 * 256);
+        }
+        return sheet;
+    }
+
+    private void writeCsvRow(BufferedWriter writer, List<ExportColumnRequest> columns, SearchResponse response) {
+        try {
+            String line = columns.stream()
+                    .map(column -> escapeCsvCell(resolveExportColumnValue(response, column.getKey())))
+                    .collect(Collectors.joining(","));
+            writer.write(line);
+            writer.newLine();
+        } catch (IOException ex) {
+            throw new UncheckedIOException(ex);
+        }
+    }
+
+    private void writeExcelRow(Row row, List<ExportColumnRequest> columns, SearchResponse response) {
+        for (int i = 0; i < columns.size(); i++) {
+            row.createCell(i).setCellValue(resolveExportColumnValue(response, columns.get(i).getKey()));
+        }
+    }
+
+    private List<ExportColumnRequest> normalizeExportColumns(List<ExportColumnRequest> columns) {
+        if (columns == null || columns.isEmpty()) {
+            return List.of(new ExportColumnRequest("reference", "Reference"));
+        }
+        Map<String, ExportColumnRequest> unique = new LinkedHashMap<>();
+        for (ExportColumnRequest column : columns) {
+            if (column == null || !notBlank(column.getKey())) continue;
+            String key = column.getKey().trim();
+            String label = notBlank(column.getLabel()) ? column.getLabel().trim() : key;
+            unique.putIfAbsent(key, new ExportColumnRequest(key, label));
+        }
+        if (unique.isEmpty()) {
+            return List.of(new ExportColumnRequest("reference", "Reference"));
+        }
+        return List.copyOf(unique.values());
+    }
+
+    private String resolveExportColumnValue(SearchResponse response, String key) {
+        if (response == null || !notBlank(key)) return "";
+        return switch (key) {
+            case "reference" -> stringifyExportValue(buildExportReference(response));
+            case "format" -> stringifyExportValue(normalizeExportFormat(response.getFormat()));
+            case "type" -> stringifyExportValue(response.getType());
+            default -> stringifyExportValue(readSearchResponseField(response, key));
+        };
+    }
+
+    private String buildExportReference(SearchResponse response) {
+        if (response == null) return "";
+        String uetr = response.getUetr();
+        String id = firstNonBlank(response.getId(),
+                response.getSequenceNumber() == null ? null : String.valueOf(response.getSequenceNumber()));
+        return firstNonBlank(
+                response.getReference(),
+                response.getMur(),
+                response.getTransactionReference(),
+                response.getTransferReference(),
+                response.getRelatedReference(),
+                response.getUserReference(),
+                response.getReference(),
+                uetr == null ? null : "UETR-" + uetr.substring(0, Math.min(8, uetr.length())).toUpperCase(),
+                id == null ? null : "ID-" + id.substring(0, Math.min(10, id.length()))
+        );
+    }
+
+    private String normalizeExportFormat(String rawFormat) {
+        if (!notBlank(rawFormat)) return rawFormat;
+        return rawFormat.replace("ALL-MT&MX", "ALL MT&MX");
+    }
+
+    private Object readSearchResponseField(SearchResponse response, String key) {
+        Field field = SEARCH_RESPONSE_FIELDS.get(key);
+        if (field == null) return null;
+        try {
+            return field.get(response);
+        } catch (IllegalAccessException ignored) {
+            return null;
+        }
+    }
+
+    private String stringifyExportValue(Object value) {
+        if (value == null) return "";
+        if (value instanceof String str) return str;
+        if (value instanceof Number || value instanceof Boolean) return String.valueOf(value);
+        return value instanceof Instant instant ? instant.toString() : stringifyFallback(value);
+    }
+
+    private String stringifyFallback(Object value) {
+        try {
+            return value instanceof Map || value instanceof List ? new Document("value", value).toJson().replaceFirst("^\\{\"value\":", "").replaceFirst("}$", "") : String.valueOf(value);
+        } catch (Exception ignored) {
+            return String.valueOf(value);
+        }
+    }
+
+    private String escapeCsvCell(String value) {
+        String safe = value == null ? "" : value.replace("\"", "\"\"");
+        return "\"" + safe + "\"";
+    }
+
+    private static Map<String, Field> initSearchResponseFields() {
+        Map<String, Field> fields = new LinkedHashMap<>();
+        for (Field field : SearchResponse.class.getDeclaredFields()) {
+            field.setAccessible(true);
+            fields.put(field.getName(), field);
+        }
+        return Map.copyOf(fields);
+    }
+
+    private static final class ExcelSheetCursor {
+        private Sheet sheet;
+        private int sheetIndex;
+        private int rowIndex;
+        private int dataRows;
+
+        private ExcelSheetCursor(Sheet sheet, int sheetIndex, int rowIndex, int dataRows) {
+            this.sheet = sheet;
+            this.sheetIndex = sheetIndex;
+            this.rowIndex = rowIndex;
+            this.dataRows = dataRows;
+        }
     }
 
     private Document withPayloadDoc(Document doc, Document payloadDoc) {
@@ -1288,6 +1759,31 @@ public class SearchService {
             merged.addAll(distinct(collection, fieldPath));
         }
         return merged.stream().sorted().collect(Collectors.toList());
+    }
+
+    private List<String> distinctMessageCodesByFamily(String collection, String family) {
+        try {
+            List<Document> pipeline = List.of(
+                    new Document("$project", new Document("messageFamily",
+                            new Document("$ifNull", Arrays.asList("$messageFamily", "$header.messageFamily")))
+                            .append("messageTypeCode",
+                                    new Document("$ifNull", Arrays.asList("$messageTypeCode", "$header.messageTypeCode")))),
+                    new Document("$match", new Document("messageFamily", family)
+                            .append("messageTypeCode", new Document("$nin", Arrays.asList(null, "")))),
+                    new Document("$group", new Document("_id", "$messageTypeCode")),
+                    new Document("$sort", new Document("_id", 1))
+            );
+
+            return mongoTemplate.getCollection(collection)
+                    .aggregate(pipeline)
+                    .into(new ArrayList<>())
+                    .stream()
+                    .map(doc -> stringValue(doc.get("_id")))
+                    .filter(this::notBlank)
+                    .collect(Collectors.toList());
+        } catch (Exception ignored) {
+            return Collections.emptyList();
+        }
     }
 
     private Document regexClause(String fieldPath, String value) {
@@ -1442,6 +1938,13 @@ public class SearchService {
     }
 
     private record SearchPlan(Document messageMatch, Document postLookupMatch, boolean requiresLookup) {
+    }
+
+    private record DropdownFieldSpec(
+            String key,
+            BiConsumer<DropdownOptionsResponse, List<String>> setter,
+            Function<DropdownOptionsResponse, List<String>> getter
+    ) {
     }
 
     private record CachedValue<T>(T value, long loadedAtMs) {

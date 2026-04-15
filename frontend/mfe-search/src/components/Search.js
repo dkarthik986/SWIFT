@@ -6,6 +6,7 @@ import { useAuth } from "../AuthContext";
 // ── All API endpoints read from .env — no hardcoded URLs ─────────────────────
 const API_BASE_URL      = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search`;
 const API_EXPORT_ALL_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/export-all`;
+const API_EXPORT_ALL_FILE_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/export-all/file`;
 const API_DETAIL_BY_REF_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/detail/by-reference`;
 const API_DETAILS_BY_REFS_URL = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/search/details/by-references`;
 const API_DROPDOWN_URL   = `${process.env.REACT_APP_API_BASE_URL || "http://localhost:8080"}/api/dropdown-options`;
@@ -253,6 +254,15 @@ const getRawPayloadText = (msg) => {
 
 const escapeCsvCell = (value) => `"${stringifyExportValue(value).replace(/"/g, "\"\"")}"`;
 const safeFileNamePart = (value) => String(value || "").replace(/[\\/:*?"<>|]+/g, "_").slice(0, 70);
+const extractFilenameFromDisposition = (value) => {
+    if (!value) return "";
+    const utf8Match = value.match(/filename\*=UTF-8''([^;]+)/i);
+    if (utf8Match?.[1]) {
+        try { return decodeURIComponent(utf8Match[1]); } catch { return utf8Match[1]; }
+    }
+    const plainMatch = value.match(/filename="?([^";]+)"?/i);
+    return plainMatch?.[1] || "";
+};
 
 const triggerDownload = (blob, filename) => {
     const url = URL.createObjectURL(blob);
@@ -277,6 +287,7 @@ const EXPORT_FORMAT_OPTIONS = [
 
 const MT_RAW_ONLY_EXPORT_FORMATS = new Set(["rje", "dospcc"]);
 const RESULT_TABLE_EXPORT_FORMATS = new Set(["csv", "excel", "pdf"]);
+const SERVER_STREAMED_TABLE_EXPORT_FORMATS = new Set(["csv", "excel"]);
 
 const loadScriptOnce = (src, checkReady) => new Promise((resolve, reject) => {
     if (checkReady()) { resolve(); return; }
@@ -1136,7 +1147,7 @@ const FIELD_DEFINITIONS = [
     { key: "status",               label: "Status",                  group: "Classification", type: "select",       optKey: "statuses",               placeholder: "All Statuses",       stateKeys: ["status"],                                   colKeys: ["status"],             backendParam: "status"                },
     { key: "messagePriority",      label: "Message Priority",        group: "Classification", type: "select",       optKey: "messagePriorities",      placeholder: "All Priorities",     stateKeys: ["messagePriority"],                          colKeys: ["messagePriority"],    backendParam: "messagePriority"       },
     { key: "copyIndicator",        label: "Copy Indicator",          group: "Classification", type: "select",       optKey: "copyIndicators",         placeholder: "All",                stateKeys: ["copyIndicator"],                            colKeys: [],                     backendParam: "copyIndicator"         },
-    { key: "finCopy",              label: "FIN-COPY Service",        group: "Classification", type: "select",       optKey: "finCopyServices",        placeholder: "All",                stateKeys: ["finCopy"],                                  colKeys: ["finCopy"],            backendParam: "finCopyService"        },
+    { key: "finCopy",              label: "FIN-COPY",                group: "Classification", type: "select",       optKey: "finCopies",              placeholder: "All",                stateKeys: ["finCopy"],                                  colKeys: ["finCopy"],            backendParam: "finCopyService"        },
     { key: "possibleDuplicate",    label: "Possible Duplicate",      group: "Classification", type: "select",       optKey: null,                     placeholder: "All",                stateKeys: ["possibleDuplicate"],                        colKeys: [],                     backendParam: "possibleDuplicate",  options: ["true","false"] },
     { key: "dateRange",            label: "Creation Date Range",     group: "Date & Time",    type: "date-range",   optKey: null,                     placeholder: null,                 stateKeys: ["startDate","startTime","endDate","endTime"], colKeys: ["date","time"],         backendParam: "startDate,endDate"     },
     { key: "valueDateRange",       label: "Value Date Range",        group: "Date & Time",    type: "date-range2",  optKey: null,                     placeholder: null,                 stateKeys: ["valueDateFrom","valueDateTo"],               colKeys: ["valueDate"],          backendParam: "valueDateFrom,valueDateTo" },
@@ -1146,9 +1157,13 @@ const FIELD_DEFINITIONS = [
     { key: "receiver",             label: "Receiver BIC",            group: "Parties",        type: "text",         placeholder: "Enter Receiver BIC",                             stateKeys: ["receiver"],                                 colKeys: ["receiver"],           backendParam: "receiver"              },
     { key: "correspondent",        label: "Correspondent",           group: "Parties",        type: "text",         placeholder: "Enter Correspondent BIC",                        stateKeys: ["correspondent"],                            colKeys: ["correspondent"],      backendParam: "correspondent"         },
     { key: "mur",                  label: "User Reference (MUR)",    group: "References",     type: "text",         placeholder: "MUR",                                            stateKeys: ["userReference"],                            colKeys: ["userReference"],      backendParam: "mur"                   },
+    { key: "sourceSystem",         label: "Source System",           group: "References",     type: "select",       optKey: "sourceSystems",          placeholder: "All Systems",        stateKeys: ["sourceSystem"],                             colKeys: ["sourceSystem"],       backendParam: "sourceSystem"          },
+    { key: "rfkReference",         label: "RFK Reference / UMID",    group: "References",     type: "text",         placeholder: "Enter RFK Reference",                            stateKeys: ["rfkReference"],                            colKeys: [],                     backendParam: "relatedReference"      },
+    { key: "messageReference",     label: "Message Reference",       group: "References",     type: "text",         placeholder: "Message Reference",                              stateKeys: ["messageReference"],                         colKeys: ["reference"],          backendParam: "reference"             },
     { key: "reference",            label: "Reference",               group: "References",     type: "text",         placeholder: "Reference",                                      stateKeys: ["reference"],                                colKeys: [],                     backendParam: "reference"             },
     { key: "transactionReference", label: "Transaction Reference",   group: "References",     type: "text",         placeholder: "Transaction Reference",                          stateKeys: ["transactionReference"],                     colKeys: [],                     backendParam: "transactionReference"  },
     { key: "sessionNumber",        label: "Session No.",             group: "References",     type: "text",         placeholder: "e.g. 0001",                                     stateKeys: ["sessionNumber"],                            colKeys: ["sessionNumber"],      backendParam: "sessionNumber"         },
+    { key: "logicalTerminalAddress", label: "Logical Terminal",      group: "References",     type: "text",         placeholder: "e.g. BPXAINAAXPUN",                              stateKeys: ["logicalTerminalAddress"],                   colKeys: ["logicalTerminalAddress"], backendParam: "logicalTerminalAddress" },
     { key: "transferReference",    label: "Transfer Reference",      group: "References",     type: "text",         placeholder: "Transfer Reference",                             stateKeys: ["transferReference"],                        colKeys: [],                     backendParam: "transferReference"     },
     { key: "relatedReference",     label: "Related Reference",       group: "References",     type: "text",         placeholder: "Related Reference",                              stateKeys: ["relatedReference"],                         colKeys: [],                     backendParam: "relatedReference"      },
     { key: "uetr",                 label: "UETR",                    group: "References",     type: "text",         placeholder: "Enter UETR (e.g. 8a562c65-...)",                 stateKeys: ["uetr"],                                     colKeys: ["uetr"],               backendParam: "uetr"                  },
@@ -1160,6 +1175,7 @@ const FIELD_DEFINITIONS = [
     { key: "amountRange",          label: "Amount Range",            group: "Financial",      type: "amount-range", placeholder: null,                                             stateKeys: ["amountFrom","amountTo"],                    colKeys: ["amount","currency"],  backendParam: "amountFrom,amountTo"   },
     { key: "currency",             label: "Currency (CCY)",          group: "Financial",      type: "select",       optKey: "currencies",             placeholder: "All Currencies",     stateKeys: ["currency"],                                 colKeys: ["currency"],           backendParam: "ccy"                   },
     { key: "network",              label: "Network Protocol",        group: "Routing",        type: "select",       optKey: "networks",               placeholder: "All Networks",       stateKeys: ["network"],                                  colKeys: ["network"],            backendParam: "networkProtocol"       },
+    { key: "backendChannel",       label: "Channel / Session",       group: "Routing",        type: "select",       optKey: "backendChannels",        placeholder: "All Channels",       stateKeys: ["backendChannel"],                           colKeys: ["backendChannel"],     backendParam: "networkChannel"        },
     { key: "networkChannel",       label: "Network Channel",         group: "Routing",        type: "select",       optKey: "networkChannels",        placeholder: "All Channels",       stateKeys: ["networkChannel"],                           colKeys: ["backendChannel"],     backendParam: "networkChannel"        },
     { key: "networkPriority",      label: "Network Priority",        group: "Routing",        type: "select",       optKey: "networkPriorities",      placeholder: "All Priorities",     stateKeys: ["networkPriority"],                          colKeys: [],                     backendParam: "networkPriority"       },
     { key: "deliveryMode",         label: "Delivery Mode",           group: "Routing",        type: "select",       optKey: "deliveryModes",          placeholder: "All Modes",          stateKeys: ["deliveryMode"],                             colKeys: ["deliveryMode"],       backendParam: "deliveryMode"          },
@@ -1173,7 +1189,7 @@ const FIELD_DEFINITIONS = [
     { key: "originatorApplication",label: "Originator Application",  group: "Ownership",      type: "select",       optKey: "originatorApplications", placeholder: "All Applications",   stateKeys: ["originatorApplication"],                    colKeys: [],                     backendParam: "originatorApplication" },
     { key: "phase",                label: "Phase",                   group: "Lifecycle",      type: "select",       optKey: "phases",                 placeholder: "All Phases",         stateKeys: ["phase"],                                    colKeys: ["phase"],              backendParam: "phase"                 },
     { key: "action",               label: "Action",                  group: "Lifecycle",      type: "select",       optKey: "actions",                placeholder: "All Actions",        stateKeys: ["action"],                                   colKeys: ["action"],             backendParam: "action"                },
-    { key: "reason",               label: "Reason",                  group: "Lifecycle",      type: "select",       optKey: "reasons",                placeholder: "All Reasons",        stateKeys: ["reason"],                                   colKeys: ["reason"],             backendParam: "reason"                },
+    { key: "reason",               label: "Reason",                  group: "Lifecycle",      type: "text",         placeholder: "Enter Reason",                                  stateKeys: ["reason"],                                   colKeys: ["reason"],             backendParam: "reason"                },
     { key: "processingType",       label: "Processing Type",         group: "Processing",     type: "select",       optKey: "processingTypes",        placeholder: "All Types",          stateKeys: ["processingType"],                           colKeys: ["processingType"],     backendParam: "processingType"        },
     { key: "processPriority",      label: "Process Priority",        group: "Processing",     type: "select",       optKey: "processPriorities",      placeholder: "All Priorities",     stateKeys: ["processPriority"],                          colKeys: [],                     backendParam: "processPriority"       },
     { key: "profileCode",          label: "Profile Code",            group: "Processing",     type: "select",       optKey: "profileCodes",           placeholder: "All Profiles",       stateKeys: ["profileCode"],                              colKeys: [],                     backendParam: "profileCode"           },
@@ -1304,10 +1320,43 @@ const getDynamicExtraColumns = (fields) => {
 
 const FIELD_GROUPS = ["Classification", "Date & Time", "Parties", "References", "Financial", "Routing", "Ownership", "Lifecycle", "Processing", "Compliance", "History", "Other"];
 const ADV_HIDDEN_GROUPS = new Set(["Payload"]);
+const ADV_PICKER_GROUP_ORDER = ["Dropdown Search", "Text Search", "Range & Date Search", "Other Search"];
+const ADV_FIXED_ALLOWED_FIELD_KEYS = new Set([
+    "format", "type", "dateRange", "mur", "sourceSystem", "rfkReference",
+    "direction", "status", "finCopy", "network", "sender", "receiver",
+    "phase", "action", "reason", "correspondent", "amountRange", "currency",
+    "ownerUnit", "messageReference", "seqRange", "sessionNumber",
+    "logicalTerminalAddress", "uetr", "freeSearchText", "backendChannel", "networkChannel"
+]);
+const ADV_FIXED_ALLOWED_STATE_KEYS = new Set([
+    "format", "type", "startDate", "startTime", "endDate", "endTime",
+    "userReference", "sourceSystem", "rfkReference", "direction", "status",
+    "finCopy", "network", "sender", "receiver", "phase", "action", "reason",
+    "correspondent", "amountFrom", "amountTo", "currency", "ownerUnit",
+    "messageReference", "seqFrom", "seqTo", "sessionNumber",
+    "logicalTerminalAddress", "uetr", "freeSearchText", "backendChannel", "networkChannel"
+]);
 const ADV_BASE_COLS = new Set(["sequenceNumber", "sessionNumber", "format", "type", "date", "time"]);
 const SORT_NONE = null, SORT_ASC = "asc", SORT_DESC = "desc";
 const MONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const DAYS   = ["Su","Mo","Tu","We","Th","Fr","Sa"];
+
+const getAdvancedPickerGroup = (field) => {
+    if (!field) return "Other Search";
+    if (field.type === "select" || field.type === "select-type") return "Dropdown Search";
+    if (field.type === "text" || field.type === "text-wide") return "Text Search";
+    if (["date-range", "value-date-range", "received-date-range", "status-date-range", "seq-range", "amount-range"].includes(field.type)) {
+        return "Range & Date Search";
+    }
+    return "Other Search";
+};
+
+const isAdvancedFixedField = (field) => {
+    if (!field) return false;
+    if (ADV_FIXED_ALLOWED_FIELD_KEYS.has(field.key)) return true;
+    const stateKeys = Array.isArray(field.stateKeys) ? field.stateKeys : [];
+    return stateKeys.some(key => ADV_FIXED_ALLOWED_STATE_KEYS.has(key));
+};
 
 const initialSearchState = {
     format:"", type:"", messageCode:"", startDate:"", startTime:"", endDate:"", endTime:"",
@@ -2893,8 +2942,8 @@ function Search() {
                     ...prev, ...data,
                     formats:              data.formats               || ["MT","MX"],
                     types:                data.messageCodes          || data.types              || [],
-                    mtTypes:              (data.messageCodes||[]).filter(c=>c.toUpperCase().startsWith("MT")).sort(),
-                    mxTypes:              (data.messageCodes||[]).filter(c=>!c.toUpperCase().startsWith("MT")).sort(),
+                    mtTypes:              data.mtTypes               || (data.messageCodes||[]).filter(c=>c.toUpperCase().startsWith("MT")).sort(),
+                    mxTypes:              data.mxTypes               || (data.messageCodes||[]).filter(c=>!c.toUpperCase().startsWith("MT")).sort(),
                     allMtMxTypes:         data.allMtMxTypes          || [],
                     messageCodes:         data.messageCodes          || [],
                     directions:           data.ioDirections          || data.directions         || [],
@@ -2966,7 +3015,7 @@ function Search() {
     },[searchState.format, opts]);
 
     const activeFieldDefs = useMemo(()=>{
-        const visible = (fields) => fields.filter(f => !ADV_HIDDEN_GROUPS.has(f.group));
+        const visible = (fields) => fields.filter(f => !ADV_HIDDEN_GROUPS.has(f.group) && isAdvancedFixedField(f));
         if (dynFieldsLoaded && dynamicFields.length > 0) {
             const dynKeys = new Set(dynamicFields.map(f=>f.key));
             const staticOnly = FIELD_DEFINITIONS.filter(f=>!dynKeys.has(f.key));
@@ -2974,6 +3023,11 @@ function Search() {
         }
         return visible(FIELD_DEFINITIONS);
     }, [dynFieldsLoaded, dynamicFields]);
+
+    useEffect(() => {
+        const allowedKeys = new Set(activeFieldDefs.map(f => f.key));
+        setAdvancedFields(prev => prev.filter(key => allowedKeys.has(key)));
+    }, [activeFieldDefs]);
 
     // Close dropdowns on outside click
     useEffect(()=>{
@@ -3058,79 +3112,84 @@ function Search() {
     };
 
     // ── Build URL params ─────────────────────────────────────────────────────
-    const buildParams = useCallback((s, page, size) => {
-        const params = new URLSearchParams();
+    const buildSearchRequest = useCallback((s, page, size) => {
+        const filters = {};
         const d = (v) => v && v.replace(/\//g, "-");
-        if(s.format)               params.set("messageType",           s.format);
+        const setFilter = (key, value) => {
+            if (value !== undefined && value !== null && value !== "") {
+                filters[key] = String(value);
+            }
+        };
+
+        setFilter("messageType", s.format);
         const msgCode = s.messageCode || s.type;
-        if(msgCode)                params.set("messageCode",           msgCode);
+        setFilter("messageCode", msgCode);
         const dirVal = s.direction || s.io;
-        if(dirVal)                 params.set("io",                    dirVal);
-        if(s.status)               params.set("status",                s.status);
-        if(s.messagePriority)      params.set("messagePriority",       s.messagePriority);
-        if(s.copyIndicator)        params.set("copyIndicator",         s.copyIndicator);
-        if(s.finCopy)              params.set("finCopyService",        s.finCopy);
-        if(s.possibleDuplicate)    params.set("possibleDuplicate",     s.possibleDuplicate);
-        if(s.sender)               params.set("sender",                s.sender);
-        if(s.receiver)             params.set("receiver",              s.receiver);
-        if(s.correspondent)        params.set("correspondent",         s.correspondent);
-        if(s.messageReference)     params.set("reference",             s.messageReference);
-        if(s.reference)            params.set("reference",             s.reference);
-        if(s.transactionReference) params.set("transactionReference",  s.transactionReference);
-        if(s.transferReference)    params.set("transferReference",     s.transferReference);
-        if(s.relatedReference)     params.set("relatedReference",      s.relatedReference);
-        if(s.userReference)        params.set("mur",                   s.userReference);
-        if(s.uetr)                 params.set("uetr",                  s.uetr);
-        if(s.mxInputReference)     params.set("mxInputReference",      s.mxInputReference);
-        if(s.mxOutputReference)    params.set("mxOutputReference",     s.mxOutputReference);
-        if(s.networkReference)     params.set("networkReference",      s.networkReference);
-        if(s.e2eMessageId)         params.set("e2eMessageId",          s.e2eMessageId);
-        if(s.currency)             params.set("ccy",                   s.currency);
-        if(s.amountFrom && !isNaN(parseFloat(s.amountFrom))) params.set("amountFrom", parseFloat(s.amountFrom));
-        if(s.amountTo   && !isNaN(parseFloat(s.amountTo)))   params.set("amountTo",   parseFloat(s.amountTo));
-        if(s.network)              params.set("networkProtocol",       s.network);
+        setFilter("io", dirVal);
+        setFilter("status", s.status);
+        setFilter("messagePriority", s.messagePriority);
+        setFilter("copyIndicator", s.copyIndicator);
+        setFilter("finCopyService", s.finCopy);
+        setFilter("possibleDuplicate", s.possibleDuplicate);
+        setFilter("sender", s.sender);
+        setFilter("receiver", s.receiver);
+        setFilter("correspondent", s.correspondent);
+        setFilter("reference", s.reference || s.messageReference);
+        setFilter("transactionReference", s.transactionReference);
+        setFilter("transferReference", s.transferReference);
+        setFilter("relatedReference", s.relatedReference || s.rfkReference);
+        setFilter("mur", s.userReference);
+        setFilter("uetr", s.uetr);
+        setFilter("mxInputReference", s.mxInputReference);
+        setFilter("mxOutputReference", s.mxOutputReference);
+        setFilter("networkReference", s.networkReference);
+        setFilter("e2eMessageId", s.e2eMessageId);
+        setFilter("ccy", s.currency);
+        if(s.amountFrom && !isNaN(parseFloat(s.amountFrom))) setFilter("amountFrom", parseFloat(s.amountFrom));
+        if(s.amountTo   && !isNaN(parseFloat(s.amountTo)))   setFilter("amountTo", parseFloat(s.amountTo));
+        setFilter("networkProtocol", s.network);
         const netChan = s.backendChannel || s.networkChannel;
-        if(netChan)                params.set("networkChannel",        netChan);
-        if(s.networkPriority)      params.set("networkPriority",       s.networkPriority);
-        if(s.deliveryMode)         params.set("deliveryMode",          s.deliveryMode);
-        if(s.service)              params.set("service",               s.service);
-        if(s.country)              params.set("country",               s.country);
-        if(s.originCountry)        params.set("originCountry",         s.originCountry);
-        if(s.destinationCountry)   params.set("destinationCountry",    s.destinationCountry);
-        if(s.ownerUnit)            params.set("owner",                 s.ownerUnit);
-        if(s.workflow)             params.set("workflow",              s.workflow);
-        if(s.workflowModel)        params.set("workflowModel",         s.workflowModel);
-        if(s.originatorApplication)params.set("originatorApplication", s.originatorApplication);
-        if(s.sourceSystem)         params.set("sourceSystem",          s.sourceSystem);
-        if(s.phase)                params.set("phase",                 s.phase);
-        if(s.action)               params.set("action",                s.action);
-        if(s.reason)               params.set("reason",                s.reason);
-        if(s.processingType)       params.set("processingType",        s.processingType);
-        if(s.processPriority)      params.set("processPriority",       s.processPriority);
-        if(s.profileCode)          params.set("profileCode",           s.profileCode);
-        if(s.environment)          params.set("environment",           s.environment);
-        if(s.nack)                 params.set("nack",                  s.nack);
-        if(s.amlStatus)            params.set("amlStatus",             s.amlStatus);
-        if(s.amlDetails)           params.set("amlDetails",            s.amlDetails);
-        if(s.seqFrom && !isNaN(parseInt(s.seqFrom,10))) params.set("seqFrom", parseInt(s.seqFrom,10));
-        if(s.seqTo   && !isNaN(parseInt(s.seqTo,  10))) params.set("seqTo",   parseInt(s.seqTo,  10));
-        if(s.sessionNumber)        params.set("sessionNumber",         s.sessionNumber);
-        if(s.logicalTerminalAddress) params.set("logicalTerminalAddress", s.logicalTerminalAddress);
-        if(s.startDate)            params.set("startDate",             d(s.startDate));
-        if(s.endDate)              params.set("endDate",               d(s.endDate));
-        if(s.valueDateFrom)        params.set("valueDateFrom",         d(s.valueDateFrom));
-        if(s.valueDateTo)          params.set("valueDateTo",           d(s.valueDateTo));
-        if(s.statusDateFrom)       params.set("statusDateFrom",        d(s.statusDateFrom));
-        if(s.statusDateTo)         params.set("statusDateTo",          d(s.statusDateTo));
-        if(s.receivedDateFrom)     params.set("receivedDateFrom",      d(s.receivedDateFrom));
-        if(s.receivedDateTo)       params.set("receivedDateTo",        d(s.receivedDateTo));
-        if(s.historyEntity)        params.set("historyEntity",         s.historyEntity);
-        if(s.historyDescription)   params.set("historyDescription",    s.historyDescription);
-        if(s.historyPhase)         params.set("historyPhase",          s.historyPhase);
-        if(s.historyAction)        params.set("historyAction",         s.historyAction);
-        if(s.historyUser)          params.set("historyUser",           s.historyUser);
-        if(s.historyChannel)       params.set("historyChannel",        s.historyChannel);
-        if(s.freeSearchText)       params.set("freeSearchText",        s.freeSearchText);
+        setFilter("networkChannel", netChan);
+        setFilter("networkPriority", s.networkPriority);
+        setFilter("deliveryMode", s.deliveryMode);
+        setFilter("service", s.service);
+        setFilter("country", s.country);
+        setFilter("originCountry", s.originCountry);
+        setFilter("destinationCountry", s.destinationCountry);
+        setFilter("owner", s.ownerUnit);
+        setFilter("workflow", s.workflow);
+        setFilter("workflowModel", s.workflowModel);
+        setFilter("originatorApplication", s.originatorApplication);
+        setFilter("sourceSystem", s.sourceSystem);
+        setFilter("phase", s.phase);
+        setFilter("action", s.action);
+        setFilter("reason", s.reason);
+        setFilter("processingType", s.processingType);
+        setFilter("processPriority", s.processPriority);
+        setFilter("profileCode", s.profileCode);
+        setFilter("environment", s.environment);
+        setFilter("nack", s.nack);
+        setFilter("amlStatus", s.amlStatus);
+        setFilter("amlDetails", s.amlDetails);
+        if(s.seqFrom && !isNaN(parseInt(s.seqFrom,10))) setFilter("seqFrom", parseInt(s.seqFrom,10));
+        if(s.seqTo   && !isNaN(parseInt(s.seqTo,10)))   setFilter("seqTo", parseInt(s.seqTo,10));
+        setFilter("sessionNumber", s.sessionNumber);
+        setFilter("logicalTerminalAddress", s.logicalTerminalAddress);
+        setFilter("startDate", d(s.startDate));
+        setFilter("endDate", d(s.endDate));
+        setFilter("valueDateFrom", d(s.valueDateFrom));
+        setFilter("valueDateTo", d(s.valueDateTo));
+        setFilter("statusDateFrom", d(s.statusDateFrom));
+        setFilter("statusDateTo", d(s.statusDateTo));
+        setFilter("receivedDateFrom", d(s.receivedDateFrom));
+        setFilter("receivedDateTo", d(s.receivedDateTo));
+        setFilter("historyEntity", s.historyEntity);
+        setFilter("historyDescription", s.historyDescription);
+        setFilter("historyPhase", s.historyPhase);
+        setFilter("historyAction", s.historyAction);
+        setFilter("historyUser", s.historyUser);
+        setFilter("historyChannel", s.historyChannel);
+        setFilter("freeSearchText", s.freeSearchText);
 
         const handledBackendParams = new Set([
             "messageType", "messageCode", "io", "status", "messagePriority", "copyIndicator",
@@ -3148,32 +3207,44 @@ function Search() {
         ]);
 
         activeFieldDefs.forEach(def => {
-            const backendParam = def.backendParam;
-            const stateKeys = def.stateKeys || [def.key];
+            const backendParam = typeof def?.backendParam === "string" ? def.backendParam : "";
+            const stateKeys = Array.isArray(def?.stateKeys) && def.stateKeys.length ? def.stateKeys : [def?.key];
             if (!backendParam || handledBackendParams.has(backendParam) || backendParam.includes(",") || stateKeys.length !== 1) {
                 return;
             }
-            if (def.type === "date-range" || def.type === "date-range2" || def.type === "amount-range" || def.type === "seq-range") {
+            if (def?.type === "date-range" || def?.type === "date-range2" || def?.type === "amount-range" || def?.type === "seq-range") {
                 return;
             }
             const value = s[stateKeys[0]];
             if (value !== undefined && value !== null && value !== "") {
-                params.set(backendParam, value);
+                setFilter(backendParam, value);
             }
         });
 
-        params.set("page", page);
-        params.set("size", size);
-        return params;
+        return {
+            page,
+            size,
+            filters,
+        };
     }, [activeFieldDefs]);
 
     // ── Execute SWIFT message search ──────────────────────────────────────────
+    const isEventArg = (value) => !!(value && typeof value === "object" && (
+        typeof value.preventDefault === "function" ||
+        "nativeEvent" in value ||
+        "currentTarget" in value ||
+        "target" in value
+    ));
+
     const handleSearch=(pageOverride, sizeOverride)=>{
         setIsSearching(true); setIsFetching(true); setFetchError(null);
-        const page = (pageOverride !== undefined) ? pageOverride : 0;
-        const size = sizeOverride ?? recordsPerPage;
-        const params = buildParams(searchState, page, size);
-        fetch(`${API_BASE_URL}?${params.toString()}`, { headers: authHeaders() })
+        try {
+            const safePageOverride = isEventArg(pageOverride) ? undefined : pageOverride;
+            const safeSizeOverride = isEventArg(sizeOverride) ? undefined : sizeOverride;
+            const page = (safePageOverride !== undefined) ? safePageOverride : 0;
+            const size = safeSizeOverride ?? recordsPerPage;
+            const requestBody = buildSearchRequest(searchState, page, size);
+            fetch(API_BASE_URL, { method: "POST", headers: authHeaders(), body: JSON.stringify(requestBody) })
             .then(r=>{ if(!r.ok) throw new Error(`Search failed (${r.status})`); return r.json(); })
             .then(data=>{
                 const rows = data.content || data;
@@ -3195,6 +3266,11 @@ function Search() {
                 setFetchError(err.message); setIsSearching(false); setIsFetching(false);
                 showToast(err.message, "error");
             });
+        } catch (err) {
+            const message = err?.message || "Search request build failed";
+            setFetchError(message); setIsSearching(false); setIsFetching(false);
+            showToast(message, "error");
+        }
     };
 
     const handleKeyDown=(e)=>{ if(e.key==="Enter") handleSearch(); };
@@ -3386,8 +3462,12 @@ function Search() {
 
     // ── Export ───────────────────────────────────────────────────────────────
     const fetchSearchPage = useCallback(async (page, size) => {
-        const params = buildParams(searchState, page, size);
-        const res = await fetch(`${API_BASE_URL}?${params.toString()}`, { headers: authHeaders() });
+        const requestBody = buildSearchRequest(searchState, page, size);
+        const res = await fetch(API_BASE_URL, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify(requestBody),
+        });
         if (!res.ok) throw new Error(`Export fetch failed (${res.status}) on page ${page + 1}`);
         const data = await res.json();
         return {
@@ -3395,17 +3475,44 @@ function Search() {
             totalPages: Number(data?.totalPages) || 1,
             pageSize: Number(data?.pageSize) || size,
         };
-    }, [authHeaders, buildParams, searchState]);
+    }, [authHeaders, buildSearchRequest, searchState]);
 
     const fetchAllRows = useCallback(async () => {
-        const params = buildParams(searchState, 0, recordsPerPage);
-        params.delete("page");
-        params.delete("size");
-        const res = await fetch(`${API_EXPORT_ALL_URL}?${params.toString()}`, { headers: authHeaders() });
+        const requestBody = buildSearchRequest(searchState, 0, recordsPerPage);
+        const res = await fetch(API_EXPORT_ALL_URL, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify({ filters: requestBody.filters }),
+        });
         if (!res.ok) throw new Error(`Export fetch failed (${res.status})`);
         const data = await res.json();
         return Array.isArray(data) ? data : (Array.isArray(data?.content) ? data.content : []);
-    }, [authHeaders, buildParams, searchState, recordsPerPage]);
+    }, [authHeaders, buildSearchRequest, searchState, recordsPerPage]);
+
+    const backendTableExportColumns = useMemo(() => (
+        [{ key: "reference", label: "Reference" }, ...shownCols.map(c => ({ key: c.key, label: c.label }))]
+    ), [shownCols]);
+
+    const downloadBackendTableAllExport = useCallback(async (format) => {
+        const requestBody = buildSearchRequest(searchState, 0, recordsPerPage);
+        const res = await fetch(`${API_EXPORT_ALL_FILE_URL}?format=${encodeURIComponent(format)}`, {
+            method: "POST",
+            headers: authHeaders(),
+            body: JSON.stringify({
+                filters: requestBody.filters,
+                columns: backendTableExportColumns,
+            }),
+        });
+        if (!res.ok) {
+            let detail = "";
+            try { detail = await res.text(); } catch {}
+            throw new Error(`Export download failed (${res.status})${detail ? `: ${detail}` : ""}`);
+        }
+        const blob = await res.blob();
+        const filename = extractFilenameFromDisposition(res.headers.get("Content-Disposition"))
+            || `swift_messages_result_table_all.${format === "excel" ? "xlsx" : format}`;
+        triggerDownload(blob, filename);
+    }, [authHeaders, backendTableExportColumns, buildSearchRequest, recordsPerPage, searchState]);
 
     const fetchMessageDetailsByReferences = useCallback(async (references) => {
         const uniqueRefs = [...new Set((references || []).filter(Boolean))];
@@ -3427,7 +3534,7 @@ function Search() {
             return messages || [];
         }
         const refsNeedingDetail = (messages || [])
-            .filter(msg => !(msg.rawMessage || msg.block4Fields || msg.historyLines))
+            .filter(msg => !msg.rawMessage)
             .map(msg => msg.reference || msg.messageReference)
             .filter(Boolean);
         if (refsNeedingDetail.length === 0) {
@@ -4058,6 +4165,19 @@ function Search() {
             if (format === "word" && isWordExportDisabledForTargets(orderedKeys)) {
                 throw new Error("Word export is unavailable when Raw Copies is selected.");
             }
+
+            const useBackendTableAllExport = scope === "all"
+                && orderedKeys.length === 1
+                && orderedKeys[0] === "table"
+                && SERVER_STREAMED_TABLE_EXPORT_FORMATS.has(format);
+
+            if (useBackendTableAllExport) {
+                showToast(`Preparing ${format.toUpperCase()} export on server for ${serverTotal.toLocaleString()} rows…`, "info");
+                await downloadBackendTableAllExport(format);
+                showToast(`Exported Result Table (${serverTotal.toLocaleString()} rows) as ${format.toUpperCase()}`);
+                return;
+            }
+
             let messages;
             if (scope === "all") {
                 const label = orderedKeys.map(getExportTargetLabel).join(" + ") || "data";
@@ -4259,23 +4379,25 @@ function Search() {
         );
     };
 
-    const filteredFieldDefs = activeFieldDefs.filter(f=>
-        f.key !== "dateRange" &&
-        !advancedFields.includes(f.key) &&
-        (fieldPickerQuery==="" || f.label.toLowerCase().includes(fieldPickerQuery.toLowerCase()) || f.group.toLowerCase().includes(fieldPickerQuery.toLowerCase()))
-    );
+    const filteredFieldDefs = activeFieldDefs.filter(f=>{
+        if (f.key === "dateRange" || advancedFields.includes(f.key)) return false;
+        const query = fieldPickerQuery.trim().toLowerCase();
+        if (!query) return true;
+        const pickerGroup = getAdvancedPickerGroup(f).toLowerCase();
+        return f.label.toLowerCase().includes(query)
+            || f.group.toLowerCase().includes(query)
+            || pickerGroup.includes(query);
+    });
 
-    const allGroups = useMemo(()=>{
-        const groups = new Set(FIELD_GROUPS);
-        activeFieldDefs.forEach(f=>{ if(f.group && !ADV_HIDDEN_GROUPS.has(f.group)) groups.add(f.group); });
-        return [...groups];
-    }, [activeFieldDefs]);
-
-    const groupedFields = allGroups.reduce((acc,g)=>{
-        const items = filteredFieldDefs.filter(f=>f.group===g);
-        if (items.length) acc[g]=items;
-        return acc;
-    },{});
+    const groupedFields = useMemo(() => {
+        return ADV_PICKER_GROUP_ORDER.reduce((acc, groupLabel) => {
+            const items = filteredFieldDefs
+                .filter(field => getAdvancedPickerGroup(field) === groupLabel)
+                .sort((a, b) => a.label.localeCompare(b.label));
+            if (items.length) acc[groupLabel] = items;
+            return acc;
+        }, {});
+    }, [filteredFieldDefs]);
 
     // ── Multi-window modal system ────────────────────────────────────────────
     useEffect(() => {
@@ -4732,7 +4854,7 @@ function Search() {
             {searchMode !== "rawcopies" && (
                 <div className="action-bar">
                     <div className="action-left">
-                        <button className={`search-btn${isSearching?" btn-loading":""}`} onClick={handleSearch} disabled={isSearching}>
+                        <button className={`search-btn${isSearching?" btn-loading":""}`} onClick={()=>handleSearch()} disabled={isSearching}>
                             {isSearching?(<><span className="spinner"/>Searching...</>):(<><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="22" y2="22"/></svg>Search</>)}
                         </button>
                         <button className="clear-btn" onClick={handleClear}><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 102.13-9.36L1 10"/></svg>Reset</button>
